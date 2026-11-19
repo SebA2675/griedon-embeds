@@ -122,7 +122,9 @@ async def callback(code: str = "", state: str = ""):
             user = await resp.json()
     if str(user["id"]) != OWNER_ID:
         raise HTTPException(403, "This dashboard is private")
-    return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#token={make_token(OWNER_ID, 60 * 24 * 7)}")
+    pass_token = make_token(OWNER_ID, 60 * 24 * 7)
+    return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#token={pass_token}")
+
 
 @app.get("/me")
 async def me(authorization: str = Header(default=None)):
