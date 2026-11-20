@@ -24,6 +24,9 @@ def check_action(action, ctx):
     if kind == "reply":
         if action.get("reply_id") not in ctx["reply_ids"]:
             raise ValueError("Something points to a reply that doesn't exist")
+    elif kind == "form":
+        if action.get("form_id") not in ctx["form_ids"]:
+            raise ValueError("Something points to a form that doesn't exist")
     elif kind == "role":
         if not str(action.get("role_id", "")).strip().isdigit():
             raise ValueError("A role action has no role chosen")
@@ -31,6 +34,18 @@ def check_action(action, ctx):
             raise ValueError("A role action has a bad mode")
     else:
         raise ValueError("Unknown action")
+
+
+def check_form(form):
+    name = form.get("name") or "A form"
+    fields = form.get("fields", [])
+    if not 1 <= len(fields) <= 5:
+        raise ValueError(f"{name} needs 1 to 5 questions")
+    for f in fields:
+        if not str(f.get("label", "")).strip():
+            raise ValueError(f"{name} has a question with no label")
+    if not str(form.get("channel_id", "")).strip().isdigit():
+        raise ValueError(f"{name} has no channel chosen for the answers")
 
 
 def build_button(b, ctx):
@@ -137,8 +152,11 @@ def build_item(block, ctx):
 
 
 def make_ctx(layout, message_id):
-    ids = {r.get("id") for r in layout.get("replies", [])}
-    return {"message_id": message_id, "reply_ids": ids}
+    return {
+        "message_id": message_id,
+        "reply_ids": {r.get("id") for r in layout.get("replies", [])},
+        "form_ids": {f.get("id") for f in layout.get("forms", [])},
+    }
 
 
 def view_from_blocks(blocks, ctx):
@@ -152,6 +170,8 @@ def view_from_blocks(blocks, ctx):
 
 def build_view(layout, message_id):
     ctx = make_ctx(layout, message_id)
+    for form in layout.get("forms", []):
+        check_form(form)
     for reply in layout.get("replies", []):
         view_from_blocks(reply.get("blocks", []), ctx)
     return view_from_blocks(layout.get("blocks", []), ctx)
