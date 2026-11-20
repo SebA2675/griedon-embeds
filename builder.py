@@ -3,6 +3,13 @@ import discord
 MAX_BUTTONS = 5
 MAX_IMAGES = 10
 
+STYLES = {
+    "grey": discord.ButtonStyle.secondary,
+    "blue": discord.ButtonStyle.primary,
+    "green": discord.ButtonStyle.success,
+    "red": discord.ButtonStyle.danger,
+}
+
 
 def colour_from_hex(value):
     try:
@@ -11,7 +18,36 @@ def colour_from_hex(value):
         return discord.Colour(0x5865F2)
 
 
-def build_item(block):
+def build_button(b, ctx):
+    label = str(b.get("label", "")).strip()
+    if not label:
+        raise ValueError("A button has no label")
+    action = b.get("action") or {"type": "link", "url": b.get("url", "")}
+    kind = action.get("type")
+
+    if kind == "link":
+        url = str(action.get("url", "")).strip()
+        if not url.startswith("https://"):
+            raise ValueError("Button links must start with https://")
+        return discord.ui.Button(style=discord.ButtonStyle.link, label=label[:80], url=url)
+
+    if kind == "reply":
+        if action.get("reply_id") not in ctx["reply_ids"]:
+            raise ValueError("A button points to a reply that doesn't exist")
+    elif kind == "role":
+        if not str(action.get("role_id", "")).strip().isdigit():
+            raise ValueError("A role button has no role chosen")
+        if action.get("mode", "toggle") not in ("toggle", "add", "remove"):
+            raise ValueError("A role button has a bad mode")
+    else:
+        raise ValueError("Unknown button action")
+
+    style = STYLES.get(b.get("style"), discord.ButtonStyle.secondary)
+    custom_id = f"m:{ctx['message_id']}:{b['id']}"
+    return discord.ui.Button(style=style, label=label[:80], custom_id=custom_id)
+
+
+def build_item(block, ctx):
     kind = block.get("type")
 
     if kind == "text":
@@ -46,13 +82,7 @@ def build_item(block):
             raise ValueError("Max 5 buttons per row")
         row = discord.ui.ActionRow()
         for b in buttons:
-            label = str(b.get("label", "")).strip()
-            url = str(b.get("url", "")).strip()
-            if not label:
-                raise ValueError("A button has no label")
-            if not url.startswith("https://"):
-                raise ValueError("Button links must start with https://")
-            row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label=label[:80], url=url))
+            row.add_item(build_button(b, ctx))
         return row
 
     if kind == "box":
@@ -60,17 +90,36 @@ def build_item(block):
         for child in block.get("children", []):
             if child.get("type") == "box":
                 raise ValueError("A box can't contain another box")
-            box.add_item(build_item(child))
+            box.add_item(build_item(child, ctx))
         return box
 
     raise ValueError("Unknown part type")
 
 
-def build_view(layout):
-    blocks = layout.get("blocks", [])
+def make_ctx(layout, message_id):
+    ids = {r.get("id") for r in layout.get("replies", [])}
+    return {"message_id": message_id, "reply_ids": ids}
+
+
+def view_from_blocks(blocks, ctx):
     if not blocks:
         raise ValueError("Message is empty")
     view = discord.ui.LayoutView(timeout=None)
     for block in blocks:
-        view.add_item(build_item(block))
+        view.add_item(build_item(block, ctx))
     return view
+
+
+def build_view(layout, message_id):
+    ctx = make_ctx(layout, message_id)
+    for reply in layout.get("replies", []):
+        view_from_blocks(reply.get("blocks", []), ctx)
+    return view_from_blocks(layout.get("blocks", []), ctx)
+
+
+def build_reply_view(layout, message_id, reply_id):
+    ctx = make_ctx(layout, message_id)
+    for reply in layout.get("replies", []):
+        if reply.get("id") == reply_id:
+            return view_from_blocks(reply.get("blocks", []), ctx)
+    raise ValueError("Reply not found")
