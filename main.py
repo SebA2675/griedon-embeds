@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
 import db
+import interactions
 from routes import make_router
 
 
@@ -147,6 +148,9 @@ class EmbedBot(discord.Client):
 
     async def on_ready(self):
         print(f"Online as {self.user}")
+
+    async def on_interaction(self, interaction):
+        await interactions.handle(interaction)
 
 
 db.init_db()
