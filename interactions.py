@@ -2,6 +2,7 @@ import discord
 
 import builder
 import db
+import forms
 
 
 def walk_blocks(blocks):
@@ -32,6 +33,13 @@ def find_option(layout, block_id, option_id):
             for o in b.get("options", []):
                 if o.get("id") == option_id:
                     return o
+    return None
+
+
+def find_form(layout, form_id):
+    for f in layout.get("forms", []):
+        if f.get("id") == form_id:
+            return f
     return None
 
 
@@ -78,6 +86,12 @@ async def run_action(interaction, message, action):
         await interaction.response.send_message(view=view, ephemeral=True)
     elif kind == "role":
         await handle_role(interaction, action)
+    elif kind == "form":
+        form = find_form(message["layout"], action.get("form_id"))
+        if not form:
+            await say(interaction, "This form was removed from the message.")
+            return
+        await interaction.response.send_modal(forms.FormModal(form))
     else:
         await say(interaction, "This has no action.")
 
