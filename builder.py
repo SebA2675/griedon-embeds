@@ -2,6 +2,7 @@ import discord
 
 MAX_BUTTONS = 5
 MAX_IMAGES = 10
+MAX_OPTIONS = 25
 
 STYLES = {
     "grey": discord.ButtonStyle.secondary,
@@ -18,33 +19,69 @@ def colour_from_hex(value):
         return discord.Colour(0x5865F2)
 
 
+def check_action(action, ctx):
+    kind = action.get("type")
+    if kind == "reply":
+        if action.get("reply_id") not in ctx["reply_ids"]:
+            raise ValueError("Something points to a reply that doesn't exist")
+    elif kind == "role":
+        if not str(action.get("role_id", "")).strip().isdigit():
+            raise ValueError("A role action has no role chosen")
+        if action.get("mode", "toggle") not in ("toggle", "add", "remove"):
+            raise ValueError("A role action has a bad mode")
+    else:
+        raise ValueError("Unknown action")
+
+
 def build_button(b, ctx):
     label = str(b.get("label", "")).strip()
     if not label:
         raise ValueError("A button has no label")
     action = b.get("action") or {"type": "link", "url": b.get("url", "")}
-    kind = action.get("type")
 
-    if kind == "link":
+    if action.get("type") == "link":
         url = str(action.get("url", "")).strip()
         if not url.startswith("https://"):
             raise ValueError("Button links must start with https://")
         return discord.ui.Button(style=discord.ButtonStyle.link, label=label[:80], url=url)
 
-    if kind == "reply":
-        if action.get("reply_id") not in ctx["reply_ids"]:
-            raise ValueError("A button points to a reply that doesn't exist")
-    elif kind == "role":
-        if not str(action.get("role_id", "")).strip().isdigit():
-            raise ValueError("A role button has no role chosen")
-        if action.get("mode", "toggle") not in ("toggle", "add", "remove"):
-            raise ValueError("A role button has a bad mode")
-    else:
-        raise ValueError("Unknown button action")
-
+    check_action(action, ctx)
     style = STYLES.get(b.get("style"), discord.ButtonStyle.secondary)
     custom_id = f"m:{ctx['message_id']}:{b['id']}"
     return discord.ui.Button(style=style, label=label[:80], custom_id=custom_id)
+
+
+def build_dropdown(block, ctx):
+    options = block.get("options", [])
+    if not options:
+        raise ValueError("A dropdown has no options")
+    if len(options) > MAX_OPTIONS:
+        raise ValueError("Max 25 options in a dropdown")
+    items = []
+    for o in options:
+        label = str(o.get("label", "")).strip()
+        if not label:
+            raise ValueError("A dropdown option has no label")
+        check_action(o.get("action") or {}, ctx)
+        description = str(o.get("description", "")).strip()
+        items.append(
+            discord.SelectOption(
+                label=label[:100],
+                value=str(o["id"]),
+                description=description[:100] or None,
+            )
+        )
+    placeholder = str(block.get("placeholder") or "Choose an option...")[:150]
+    select = discord.ui.Select(
+        placeholder=placeholder,
+        options=items,
+        custom_id=f"m:{ctx['message_id']}:{block['id']}",
+        min_values=1,
+        max_values=1,
+    )
+    row = discord.ui.ActionRow()
+    row.add_item(select)
+    return row
 
 
 def build_item(block, ctx):
@@ -84,6 +121,9 @@ def build_item(block, ctx):
         for b in buttons:
             row.add_item(build_button(b, ctx))
         return row
+
+    if kind == "dropdown":
+        return build_dropdown(block, ctx)
 
     if kind == "box":
         box = discord.ui.Container(accent_colour=colour_from_hex(block.get("accent")))
