@@ -11,6 +11,9 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
+import db
+from routes import make_router
+
 
 def get_setting(name):
     value = os.getenv(name)
@@ -131,6 +134,9 @@ async def me(authorization: str = Header(default=None)):
     return {"user_id": require_owner(authorization)}
 
 
+app.include_router(make_router(require_owner, lambda: client))
+
+
 class EmbedBot(discord.Client):
     async def setup_hook(self):
         port = int(get_setting("SERVER_PORT") or get_setting("PORT") or 8080)
@@ -143,6 +149,7 @@ class EmbedBot(discord.Client):
         print(f"Online as {self.user}")
 
 
+db.init_db()
 client = EmbedBot(intents=discord.Intents.default())
 
 token = get_setting("BOT_TOKEN")
