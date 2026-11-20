@@ -22,6 +22,9 @@ def check_layout(layout):
     blocks = layout.get("blocks")
     if not isinstance(blocks, list):
         raise HTTPException(400, "layout must contain a list called blocks")
+    replies = layout.get("replies", [])
+    if not isinstance(replies, list) or len(replies) > 25:
+        raise HTTPException(400, "replies must be a list of at most 25")
     if len(json.dumps(layout)) > 200000:
         raise HTTPException(400, "Message is too large")
 
@@ -30,11 +33,21 @@ def clean_name(name):
     return name.strip()[:100] or "Untitled message"
 
 
-def make_view(layout):
+def make_view(layout, message_id):
     try:
-        return builder.build_view(layout)
+        return builder.build_view(layout, message_id)
     except ValueError as err:
         raise HTTPException(400, str(err))
+
+
+def get_guild(client, guild_id):
+    try:
+        guild = client.get_guild(int(guild_id))
+    except ValueError:
+        raise HTTPException(400, "Bad server id")
+    if not guild:
+        raise HTTPException(404, "Server not found")
+    return guild
 
 
 def find_channel(client, guild_id, channel_id):
@@ -100,18 +113,26 @@ def make_router(require_owner, get_client):
     @router.get("/guilds/{guild_id}/channels")
     def channels(guild_id: str, authorization: str = Header(default=None)):
         require_owner(authorization)
-        try:
-            guild = get_client().get_guild(int(guild_id))
-        except ValueError:
-            raise HTTPException(400, "Bad server id")
-        if not guild:
-            raise HTTPException(404, "Server not found")
+        guild = get_guild(get_client(), guild_id)
         result = []
         for ch in guild.text_channels:
             perms = ch.permissions_for(guild.me)
             if perms.view_channel and perms.send_messages:
                 category = ch.category.name if ch.category else None
                 result.append({"id": str(ch.id), "name": ch.name, "category": category})
+        return result
+
+    @router.get("/guilds/{guild_id}/roles")
+    def roles(guild_id: str, authorization: str = Header(default=None)):
+        require_owner(authorization)
+        guild = get_guild(get_client(), guild_id)
+        me = guild.me
+        result = []
+        for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
+            if role.is_default() or role.managed:
+                continue
+            can = bool(me.guild_permissions.manage_roles and role < me.top_role)
+            result.append({"id": str(role.id), "name": role.name, "assignable": can})
         return result
 
     @router.post("/messages/{message_id}/post")
@@ -121,7 +142,7 @@ def make_router(require_owner, get_client):
         if not found:
             raise HTTPException(404, "Message not found")
         channel = find_channel(get_client(), body.guild_id, body.channel_id)
-        view = make_view(found["layout"])
+        view = make_view(found["layout"], message_id)
         try:
             sent = await channel.send(view=view)
         except discord.HTTPException as err:
@@ -138,7 +159,7 @@ def make_router(require_owner, get_client):
         if not found["posted_message_id"]:
             raise HTTPException(400, "This message hasn't been posted yet")
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
-        view = make_view(found["layout"])
+        view = make_view(found["layout"], message_id)
         try:
             target = await channel.fetch_message(int(found["posted_message_id"]))
             await target.edit(view=view)
