@@ -14,6 +14,7 @@ from fastapi.responses import RedirectResponse
 import access
 import db
 import interactions
+import scheduler
 from routes import make_router
 
 
@@ -155,6 +156,7 @@ class EmbedBot(discord.Client):
         self.api_server = uvicorn.Server(config)
         asyncio.create_task(self.api_server.serve())
         print(f"API listening on port {port}")
+        self.sched_task = asyncio.create_task(scheduler.run_loop(self))
 
     async def leave_unapproved(self, guild):
         db.add_pending(str(guild.id), guild.name)
