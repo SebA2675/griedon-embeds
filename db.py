@@ -68,6 +68,27 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                guild_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                channel_id TEXT,
+                run_date TEXT NOT NULL,
+                run_time TEXT NOT NULL,
+                tz TEXT NOT NULL,
+                repeat_kind TEXT NOT NULL,
+                replace_previous INTEGER NOT NULL DEFAULT 0,
+                next_run INTEGER,
+                last_run INTEGER,
+                last_status TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
         rows = conn.execute("SELECT id, layout_json FROM messages WHERE guild_id IS NULL").fetchall()
         for row in rows:
             try:
@@ -162,6 +183,7 @@ def delete_message(message_id):
     with closing(connect()) as conn:
         cur = conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
         conn.execute("DELETE FROM versions WHERE message_id = ?", (message_id,))
+        conn.execute("DELETE FROM schedules WHERE message_id = ?", (message_id,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -285,6 +307,98 @@ def get_version(message_id, version_id):
         "created_at": row["created_at"],
         "layout": json.loads(row["layout_json"]),
     }
+
+
+# ---------- Schedules ----------
+
+def schedule_dict(row):
+    return {
+        "id": row["id"],
+        "message_id": row["message_id"],
+        "guild_id": row["guild_id"],
+        "action": row["action"],
+        "channel_id": row["channel_id"] or "",
+        "run_date": row["run_date"],
+        "run_time": row["run_time"],
+        "tz": row["tz"],
+        "repeat": row["repeat_kind"],
+        "replace_previous": bool(row["replace_previous"]),
+        "next_run": row["next_run"],
+        "last_run": row["last_run"],
+        "last_status": row["last_status"],
+        "active": bool(row["active"]),
+    }
+
+
+def create_schedule(message_id, guild_id, action, channel_id, run_date, run_time, tz, repeat,
+                    replace_previous, next_run):
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO schedules (message_id, guild_id, action, channel_id, run_date, run_time, tz,
+                                   repeat_kind, replace_previous, next_run, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (message_id, guild_id, action, channel_id, run_date, run_time, tz, repeat,
+             1 if replace_previous else 0, next_run, int(time.time())),
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+    return get_schedule(new_id)
+
+
+def get_schedule(schedule_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    return schedule_dict(row) if row else None
+
+
+def list_schedules(message_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM schedules WHERE message_id = ? ORDER BY active DESC, next_run", (message_id,)
+        ).fetchall()
+    return [schedule_dict(r) for r in rows]
+
+
+def count_schedules_message(message_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM schedules WHERE message_id = ?", (message_id,)).fetchone()
+    return row["n"]
+
+
+def count_schedules_guild(guild_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM schedules WHERE guild_id = ?", (guild_id,)).fetchone()
+    return row["n"]
+
+
+def delete_schedule(schedule_id):
+    with closing(connect()) as conn:
+        cur = conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def due_schedules(now):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM schedules WHERE active = 1 AND next_run IS NOT NULL AND next_run <= ? ORDER BY next_run",
+            (now,),
+        ).fetchall()
+    return [schedule_dict(r) for r in rows]
+
+
+def finish_schedule(schedule_id, last_run, status, next_run, run_date, active):
+    with closing(connect()) as conn:
+        conn.execute(
+            """
+            UPDATE schedules SET last_run = ?, last_status = ?, next_run = ?, run_date = ?, active = ?
+            WHERE id = ?
+            """,
+            (last_run, status[:300], next_run, run_date, 1 if active else 0, schedule_id),
+        )
+        conn.commit()
 
 
 # ---------- Approved servers ----------
