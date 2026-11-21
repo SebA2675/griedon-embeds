@@ -28,6 +28,32 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS allowed_guilds (
+                guild_id TEXT PRIMARY KEY,
+                name TEXT,
+                added_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_guilds (
+                guild_id TEXT PRIMARY KEY,
+                name TEXT,
+                seen_at INTEGER NOT NULL
+            )
+            """
+        )
+        rows = conn.execute("SELECT id, layout_json FROM messages WHERE guild_id IS NULL").fetchall()
+        for row in rows:
+            try:
+                gid = json.loads(row["layout_json"]).get("guild_id")
+            except ValueError:
+                gid = None
+            if gid:
+                conn.execute("UPDATE messages SET guild_id = ? WHERE id = ?", (str(gid), row["id"]))
         conn.commit()
 
 
@@ -45,10 +71,25 @@ def to_dict(row, full=True):
     return data
 
 
-def list_messages():
+def list_messages(guild_ids=None):
     with closing(connect()) as conn:
-        rows = conn.execute("SELECT * FROM messages ORDER BY updated_at DESC").fetchall()
+        if guild_ids is None:
+            rows = conn.execute("SELECT * FROM messages ORDER BY updated_at DESC").fetchall()
+        elif not guild_ids:
+            return []
+        else:
+            marks = ",".join("?" for _ in guild_ids)
+            rows = conn.execute(
+                f"SELECT * FROM messages WHERE guild_id IN ({marks}) ORDER BY updated_at DESC",
+                list(guild_ids),
+            ).fetchall()
     return [to_dict(r, full=False) for r in rows]
+
+
+def count_messages(guild_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM messages WHERE guild_id = ?", (guild_id,)).fetchone()
+    return row["n"]
 
 
 def get_message(message_id):
@@ -57,23 +98,32 @@ def get_message(message_id):
     return to_dict(row) if row else None
 
 
-def create_message(name, layout):
+def create_message(name, layout, guild_id):
     now = int(time.time())
     with closing(connect()) as conn:
         cur = conn.execute(
-            "INSERT INTO messages (name, layout_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (name, json.dumps(layout), now, now),
+            "INSERT INTO messages (name, guild_id, layout_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (name, guild_id, json.dumps(layout), now, now),
         )
         conn.commit()
         new_id = cur.lastrowid
     return get_message(new_id)
 
 
-def update_message(message_id, name, layout):
+def update_message(message_id, name, layout, guild_id):
     with closing(connect()) as conn:
         cur = conn.execute(
-            "UPDATE messages SET name = ?, layout_json = ?, updated_at = ? WHERE id = ?",
-            (name, json.dumps(layout), int(time.time()), message_id),
+            """
+            UPDATE messages SET
+                name = ?,
+                layout_json = ?,
+                updated_at = ?,
+                posted_message_id = CASE WHEN guild_id = ? THEN posted_message_id ELSE NULL END,
+                channel_id = CASE WHEN guild_id = ? THEN channel_id ELSE NULL END,
+                guild_id = ?
+            WHERE id = ?
+            """,
+            (name, json.dumps(layout), int(time.time()), guild_id, guild_id, guild_id, message_id),
         )
         conn.commit()
         changed = cur.rowcount
@@ -99,4 +149,56 @@ def set_posted(message_id, guild_id, channel_id, posted_message_id):
 def clear_posted(message_id):
     with closing(connect()) as conn:
         conn.execute("UPDATE messages SET posted_message_id = NULL WHERE id = ?", (message_id,))
+        conn.commit()
+
+
+def list_allowed():
+    with closing(connect()) as conn:
+        rows = conn.execute("SELECT * FROM allowed_guilds ORDER BY added_at").fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_allowed_ids():
+    return [r["guild_id"] for r in list_allowed()]
+
+
+def allowed_count():
+    with closing(connect()) as conn:
+        return conn.execute("SELECT COUNT(*) AS n FROM allowed_guilds").fetchone()["n"]
+
+
+def allow_guild(guild_id, name):
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO allowed_guilds (guild_id, name, added_at) VALUES (?, ?, ?)",
+            (guild_id, name, int(time.time())),
+        )
+        conn.execute("DELETE FROM pending_guilds WHERE guild_id = ?", (guild_id,))
+        conn.commit()
+
+
+def remove_allowed(guild_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM allowed_guilds WHERE guild_id = ?", (guild_id,))
+        conn.commit()
+
+
+def add_pending(guild_id, name):
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_guilds (guild_id, name, seen_at) VALUES (?, ?, ?)",
+            (guild_id, name, int(time.time())),
+        )
+        conn.commit()
+
+
+def list_pending():
+    with closing(connect()) as conn:
+        rows = conn.execute("SELECT * FROM pending_guilds ORDER BY seen_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_pending(guild_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM pending_guilds WHERE guild_id = ?", (guild_id,))
         conn.commit()
