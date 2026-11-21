@@ -24,6 +24,10 @@ def find_button(layout, button_id):
             for btn in b.get("buttons", []):
                 if btn.get("id") == button_id:
                     return btn
+        if b.get("type") == "section" and b.get("side") == "button":
+            btn = b.get("button") or {}
+            if btn.get("id") == button_id:
+                return btn
     return None
 
 
