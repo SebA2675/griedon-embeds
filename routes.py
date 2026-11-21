@@ -1,4 +1,5 @@
 import json
+import time
 
 import discord
 from fastapi import APIRouter, Header, HTTPException
@@ -9,6 +10,9 @@ import builder
 import db
 
 MAX_PER_GUILD = 200
+MAX_TEMPLATES = 100
+MAX_IMPORT_ITEMS = 100
+MAX_IMPORT_BYTES = 3000000
 
 
 class MessageIn(BaseModel):
@@ -26,6 +30,10 @@ class AllowIn(BaseModel):
     name: str = ""
 
 
+class ImportIn(BaseModel):
+    data: dict
+
+
 def check_layout(layout):
     blocks = layout.get("blocks")
     if not isinstance(blocks, list):
@@ -41,7 +49,20 @@ def check_layout(layout):
 
 
 def clean_name(name):
-    return name.strip()[:100] or "Untitled message"
+    return str(name).strip()[:100] or "Untitled message"
+
+
+def strip_guild_refs(x):
+    if isinstance(x, list):
+        for item in x:
+            strip_guild_refs(item)
+    elif isinstance(x, dict):
+        if "role_id" in x:
+            x["role_id"] = ""
+        if "fields" in x and "channel_id" in x:
+            x["channel_id"] = ""
+        for value in x.values():
+            strip_guild_refs(value)
 
 
 def make_view(layout, message_id):
@@ -98,6 +119,8 @@ def make_router(require_user, get_client, owner_id):
             raise HTTPException(403, "Only the bot owner can do this")
         return uid
 
+    # ----- Messages -----
+
     @router.get("/messages")
     async def list_all(authorization: str = Header(default=None)):
         uid = require_user(authorization)
@@ -139,6 +162,8 @@ def make_router(require_user, get_client, owner_id):
         await load_message(message_id, uid)
         db.delete_message(message_id)
         return {"deleted": True}
+
+    # ----- Servers -----
 
     @router.get("/guilds")
     async def guilds(authorization: str = Header(default=None)):
@@ -185,6 +210,8 @@ def make_router(require_user, get_client, owner_id):
                 result.append({"guild_id": str(g.id), "guild_name": g.name, "emojis": items})
         return result
 
+    # ----- Posting -----
+
     @router.post("/messages/{message_id}/post")
     async def post_message(message_id: int, body: SendIn, authorization: str = Header(default=None)):
         uid = require_user(authorization)
@@ -202,6 +229,7 @@ def make_router(require_user, get_client, owner_id):
         except discord.HTTPException as err:
             raise discord_error(err)
         db.set_posted(message_id, found["guild_id"], str(channel.id), str(sent.id))
+        db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
 
     @router.post("/messages/{message_id}/update")
@@ -221,6 +249,7 @@ def make_router(require_user, get_client, owner_id):
             raise HTTPException(404, "The posted message was deleted. Post it again.")
         except discord.HTTPException as err:
             raise discord_error(err)
+        db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
 
     @router.delete("/messages/{message_id}/posted")
@@ -239,6 +268,145 @@ def make_router(require_user, get_client, owner_id):
             raise discord_error(err)
         db.clear_posted(message_id)
         return db.get_message(message_id)
+
+    # ----- Version history -----
+
+    @router.get("/messages/{message_id}/versions")
+    async def versions(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        return db.list_versions(message_id)
+
+    @router.get("/messages/{message_id}/versions/{version_id}")
+    async def one_version(message_id: int, version_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        found = db.get_version(message_id, version_id)
+        if not found:
+            raise HTTPException(404, "Version not found")
+        return found
+
+    # ----- Export, backup, import -----
+
+    @router.get("/messages/{message_id}/export")
+    async def export_message(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        return {
+            "format": "embed-dashboard-message",
+            "version": 1,
+            "guild_id": found["guild_id"],
+            "name": found["name"],
+            "layout": found["layout"],
+        }
+
+    @router.get("/guilds/{guild_id}/backup")
+    async def backup(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        gid = str(guild.id)
+        return {
+            "format": "embed-dashboard-backup",
+            "version": 1,
+            "guild_id": gid,
+            "exported_at": int(time.time()),
+            "messages": [{"name": m["name"], "layout": m["layout"]} for m in db.list_messages_full(gid)],
+            "templates": [{"name": t["name"], "layout": t["layout"]} for t in db.list_templates_full(gid)],
+        }
+
+    @router.post("/guilds/{guild_id}/import")
+    async def import_data(guild_id: str, body: ImportIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        gid = str(guild.id)
+        data = body.data
+        if len(json.dumps(data)) > MAX_IMPORT_BYTES:
+            raise HTTPException(400, "That file is too large")
+        source = str(data.get("guild_id") or "")
+        foreign = source != gid
+
+        kind = data.get("format")
+        if kind == "embed-dashboard-message":
+            items = [{"name": data.get("name"), "layout": data.get("layout")}]
+            temps = []
+        elif kind == "embed-dashboard-backup":
+            items = data.get("messages", [])
+            temps = data.get("templates", [])
+        else:
+            raise HTTPException(400, "This file isn't an export from this dashboard")
+        if not isinstance(items, list) or not isinstance(temps, list):
+            raise HTTPException(400, "The file is damaged")
+        if len(items) > MAX_IMPORT_ITEMS or len(temps) > MAX_IMPORT_ITEMS:
+            raise HTTPException(400, "Too many items in one file")
+        if db.count_messages(gid) + len(items) > MAX_PER_GUILD:
+            raise HTTPException(400, "This would go over the saved-message limit for this server")
+        if db.count_templates(gid) + len(temps) > MAX_TEMPLATES:
+            raise HTTPException(400, "This would go over the template limit for this server")
+
+        def prepare(entries):
+            ready = []
+            for entry in entries:
+                layout = entry.get("layout") if isinstance(entry, dict) else None
+                if not isinstance(layout, dict):
+                    raise HTTPException(400, "The file is damaged")
+                check_layout(layout)
+                ready.append((clean_name(entry.get("name") or "Imported message"), layout))
+            return ready
+
+        ready_messages = prepare(items)
+        ready_templates = prepare(temps)
+        for name, layout in ready_messages:
+            layout["guild_id"] = gid
+            if foreign:
+                strip_guild_refs(layout)
+            db.create_message(name, layout, gid)
+        for name, layout in ready_templates:
+            layout["guild_id"] = gid
+            if foreign:
+                strip_guild_refs(layout)
+            db.create_template(gid, name, layout)
+        return {"messages": len(ready_messages), "templates": len(ready_templates), "stripped": foreign}
+
+    # ----- Templates -----
+
+    @router.get("/guilds/{guild_id}/templates")
+    async def list_templates(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        return db.list_templates(str(guild.id))
+
+    @router.post("/guilds/{guild_id}/templates")
+    async def make_template(guild_id: str, body: MessageIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        gid = str(guild.id)
+        check_layout(body.layout)
+        if db.count_templates(gid) >= MAX_TEMPLATES:
+            raise HTTPException(400, "This server has reached the template limit")
+        layout = dict(body.layout)
+        layout["guild_id"] = gid
+        return db.create_template(gid, clean_name(body.name), layout)
+
+    @router.get("/templates/{template_id}")
+    async def read_template(template_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = db.get_template(template_id)
+        if not found:
+            raise HTTPException(404, "Template not found")
+        await user_guild(uid, found["guild_id"])
+        return found
+
+    @router.delete("/templates/{template_id}")
+    async def remove_template(template_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = db.get_template(template_id)
+        if not found:
+            raise HTTPException(404, "Template not found")
+        await user_guild(uid, found["guild_id"])
+        db.delete_template(template_id)
+        return {"deleted": True}
+
+    # ----- Owner-only server list -----
 
     @router.get("/admin/servers")
     async def admin_servers(authorization: str = Header(default=None)):
