@@ -27,9 +27,14 @@ class FormModal(discord.ui.Modal):
             channel = interaction.client.get_channel(int(self.form.get("channel_id") or 0))
         except ValueError:
             channel = None
-        if channel is None:
+        same_server = (
+            channel is not None
+            and getattr(channel, "guild", None) is not None
+            and channel.guild.id == interaction.guild_id
+        )
+        if not same_server:
             await interaction.response.send_message(
-                "Sorry, I couldn't deliver your answers (channel not found).", ephemeral=True
+                "Sorry, I couldn't deliver your answers (channel not found in this server).", ephemeral=True
             )
             return
 
