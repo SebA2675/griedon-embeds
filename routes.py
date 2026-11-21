@@ -4,8 +4,11 @@ import discord
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
+import access
 import builder
 import db
+
+MAX_PER_GUILD = 200
 
 
 class MessageIn(BaseModel):
@@ -16,6 +19,11 @@ class MessageIn(BaseModel):
 class SendIn(BaseModel):
     guild_id: str
     channel_id: str
+
+
+class AllowIn(BaseModel):
+    guild_id: str
+    name: str = ""
 
 
 def check_layout(layout):
@@ -43,16 +51,6 @@ def make_view(layout, message_id):
         raise HTTPException(400, str(err))
 
 
-def get_guild(client, guild_id):
-    try:
-        guild = client.get_guild(int(guild_id))
-    except ValueError:
-        raise HTTPException(400, "Bad server id")
-    if not guild:
-        raise HTTPException(404, "Server not found")
-    return guild
-
-
 def find_channel(client, guild_id, channel_id):
     try:
         channel = client.get_channel(int(channel_id))
@@ -66,57 +64,92 @@ def find_channel(client, guild_id, channel_id):
     return channel
 
 
+def check_form_channels(layout, guild):
+    for form in layout.get("forms", []):
+        cid = str(form.get("channel_id", ""))
+        if not cid.isdigit() or guild.get_channel(int(cid)) is None:
+            name = form.get("name", "")
+            raise HTTPException(400, f'Form "{name}" sends answers to a channel outside this server')
+
+
 def discord_error(err):
     return HTTPException(400, "Discord refused the message: " + str(err)[:300])
 
 
-def make_router(require_owner, get_client):
+def make_router(require_user, get_client, owner_id):
     router = APIRouter()
 
-    @router.get("/messages")
-    def list_all(authorization: str = Header(default=None)):
-        require_owner(authorization)
-        return db.list_messages()
+    async def user_guild(uid, guild_id):
+        return await access.require_guild(get_client(), uid, owner_id, guild_id)
 
-    @router.post("/messages")
-    def create(body: MessageIn, authorization: str = Header(default=None)):
-        require_owner(authorization)
-        check_layout(body.layout)
-        return db.create_message(clean_name(body.name), body.layout)
-
-    @router.get("/messages/{message_id}")
-    def read_one(message_id: int, authorization: str = Header(default=None)):
-        require_owner(authorization)
+    async def load_message(message_id, uid):
         found = db.get_message(message_id)
         if not found:
             raise HTTPException(404, "Message not found")
+        if found["guild_id"]:
+            await user_guild(uid, found["guild_id"])
+        elif uid != owner_id:
+            raise HTTPException(403, "You can't open this message")
         return found
 
-    @router.put("/messages/{message_id}")
-    def save(message_id: int, body: MessageIn, authorization: str = Header(default=None)):
-        require_owner(authorization)
+    def require_owner_user(authorization):
+        uid = require_user(authorization)
+        if uid != owner_id:
+            raise HTTPException(403, "Only the bot owner can do this")
+        return uid
+
+    @router.get("/messages")
+    async def list_all(authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        if uid == owner_id:
+            return db.list_messages(None)
+        mine = await access.accessible_guilds(get_client(), uid, owner_id)
+        return db.list_messages([str(g.id) for g in mine])
+
+    @router.post("/messages")
+    async def create(body: MessageIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
         check_layout(body.layout)
-        updated = db.update_message(message_id, clean_name(body.name), body.layout)
+        gid = str(body.layout.get("guild_id") or "")
+        await user_guild(uid, gid)
+        if db.count_messages(gid) >= MAX_PER_GUILD:
+            raise HTTPException(400, "This server has reached the limit of saved messages")
+        return db.create_message(clean_name(body.name), body.layout, gid)
+
+    @router.get("/messages/{message_id}")
+    async def read_one(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        return await load_message(message_id, uid)
+
+    @router.put("/messages/{message_id}")
+    async def save(message_id: int, body: MessageIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        check_layout(body.layout)
+        gid = str(body.layout.get("guild_id") or found["guild_id"] or "")
+        await user_guild(uid, gid)
+        updated = db.update_message(message_id, clean_name(body.name), body.layout, gid)
         if not updated:
             raise HTTPException(404, "Message not found")
         return updated
 
     @router.delete("/messages/{message_id}")
-    def remove(message_id: int, authorization: str = Header(default=None)):
-        require_owner(authorization)
-        if not db.delete_message(message_id):
-            raise HTTPException(404, "Message not found")
+    async def remove(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        db.delete_message(message_id)
         return {"deleted": True}
 
     @router.get("/guilds")
-    def guilds(authorization: str = Header(default=None)):
-        require_owner(authorization)
-        return [{"id": str(g.id), "name": g.name} for g in get_client().guilds]
+    async def guilds(authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await access.accessible_guilds(get_client(), uid, owner_id)
+        return [{"id": str(g.id), "name": g.name} for g in found]
 
     @router.get("/guilds/{guild_id}/channels")
-    def channels(guild_id: str, authorization: str = Header(default=None)):
-        require_owner(authorization)
-        guild = get_guild(get_client(), guild_id)
+    async def channels(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
         result = []
         for ch in guild.text_channels:
             perms = ch.permissions_for(guild.me)
@@ -126,9 +159,9 @@ def make_router(require_owner, get_client):
         return result
 
     @router.get("/guilds/{guild_id}/roles")
-    def roles(guild_id: str, authorization: str = Header(default=None)):
-        require_owner(authorization)
-        guild = get_guild(get_client(), guild_id)
+    async def roles(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
         me = guild.me
         result = []
         for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
@@ -139,10 +172,10 @@ def make_router(require_owner, get_client):
         return result
 
     @router.get("/emojis")
-    def all_emojis(authorization: str = Header(default=None)):
-        require_owner(authorization)
+    async def all_emojis(authorization: str = Header(default=None)):
+        uid = require_user(authorization)
         result = []
-        for g in get_client().guilds:
+        for g in await access.accessible_guilds(get_client(), uid, owner_id):
             items = [
                 {"id": str(e.id), "name": e.name, "animated": e.animated}
                 for e in g.emojis
@@ -154,27 +187,31 @@ def make_router(require_owner, get_client):
 
     @router.post("/messages/{message_id}/post")
     async def post_message(message_id: int, body: SendIn, authorization: str = Header(default=None)):
-        require_owner(authorization)
-        found = db.get_message(message_id)
-        if not found:
-            raise HTTPException(404, "Message not found")
-        channel = find_channel(get_client(), body.guild_id, body.channel_id)
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        if not found["guild_id"]:
+            raise HTTPException(400, "Choose a server for this message first")
+        if str(body.guild_id) != found["guild_id"]:
+            raise HTTPException(400, "This message belongs to another server")
+        guild = await user_guild(uid, found["guild_id"])
+        check_form_channels(found["layout"], guild)
+        channel = find_channel(get_client(), found["guild_id"], body.channel_id)
         view = make_view(found["layout"], message_id)
         try:
             sent = await channel.send(view=view)
         except discord.HTTPException as err:
             raise discord_error(err)
-        db.set_posted(message_id, body.guild_id, body.channel_id, str(sent.id))
+        db.set_posted(message_id, found["guild_id"], str(channel.id), str(sent.id))
         return db.get_message(message_id)
 
     @router.post("/messages/{message_id}/update")
     async def update_posted(message_id: int, authorization: str = Header(default=None)):
-        require_owner(authorization)
-        found = db.get_message(message_id)
-        if not found:
-            raise HTTPException(404, "Message not found")
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
         if not found["posted_message_id"]:
             raise HTTPException(400, "This message hasn't been posted yet")
+        guild = await user_guild(uid, found["guild_id"])
+        check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
         view = make_view(found["layout"], message_id)
         try:
@@ -188,10 +225,8 @@ def make_router(require_owner, get_client):
 
     @router.delete("/messages/{message_id}/posted")
     async def delete_posted(message_id: int, authorization: str = Header(default=None)):
-        require_owner(authorization)
-        found = db.get_message(message_id)
-        if not found:
-            raise HTTPException(404, "Message not found")
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
         if not found["posted_message_id"]:
             raise HTTPException(400, "This message hasn't been posted yet")
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
@@ -204,5 +239,42 @@ def make_router(require_owner, get_client):
             raise discord_error(err)
         db.clear_posted(message_id)
         return db.get_message(message_id)
+
+    @router.get("/admin/servers")
+    async def admin_servers(authorization: str = Header(default=None)):
+        require_owner_user(authorization)
+        joined = {str(g.id): g.name for g in get_client().guilds}
+        allowed = []
+        for row in db.list_allowed():
+            gid = row["guild_id"]
+            allowed.append({"id": gid, "name": joined.get(gid) or row["name"], "joined": gid in joined})
+        return {"allowed": allowed, "pending": db.list_pending()}
+
+    @router.post("/admin/allow")
+    async def admin_allow(body: AllowIn, authorization: str = Header(default=None)):
+        require_owner_user(authorization)
+        gid = body.guild_id.strip()
+        if not gid.isdigit():
+            raise HTTPException(400, "A server ID is only numbers")
+        db.allow_guild(gid, body.name.strip()[:100])
+        return {"ok": True}
+
+    @router.delete("/admin/allow/{guild_id}")
+    async def admin_remove(guild_id: str, authorization: str = Header(default=None)):
+        require_owner_user(authorization)
+        if not guild_id.isdigit():
+            raise HTTPException(400, "Bad server id")
+        db.remove_allowed(guild_id)
+        guild = get_client().get_guild(int(guild_id))
+        if guild is not None:
+            db.add_pending(guild_id, guild.name)
+            await guild.leave()
+        return {"ok": True}
+
+    @router.delete("/admin/pending/{guild_id}")
+    async def admin_dismiss(guild_id: str, authorization: str = Header(default=None)):
+        require_owner_user(authorization)
+        db.remove_pending(guild_id)
+        return {"ok": True}
 
     return router
