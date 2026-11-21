@@ -1,8 +1,11 @@
+import re
+
 import discord
 
 MAX_BUTTONS = 5
 MAX_IMAGES = 10
 MAX_OPTIONS = 25
+NAME_RE = re.compile(r"^\w{1,32}$")
 
 STYLES = {
     "grey": discord.ButtonStyle.secondary,
@@ -17,6 +20,16 @@ def colour_from_hex(value):
         return discord.Colour(int(str(value).lstrip("#"), 16))
     except ValueError:
         return discord.Colour(0x5865F2)
+
+
+def make_emoji(data):
+    if not data:
+        return None
+    emoji_id = str(data.get("id", ""))
+    name = str(data.get("name", ""))
+    if not emoji_id.isdigit() or not NAME_RE.match(name):
+        raise ValueError("An emoji is invalid")
+    return discord.PartialEmoji(name=name, id=int(emoji_id), animated=bool(data.get("animated")))
 
 
 def check_action(action, ctx):
@@ -50,20 +63,23 @@ def check_form(form):
 
 def build_button(b, ctx):
     label = str(b.get("label", "")).strip()
-    if not label:
-        raise ValueError("A button has no label")
+    emoji = make_emoji(b.get("emoji"))
+    if not label and not emoji:
+        raise ValueError("A button has no label or emoji")
     action = b.get("action") or {"type": "link", "url": b.get("url", "")}
 
     if action.get("type") == "link":
         url = str(action.get("url", "")).strip()
         if not url.startswith("https://"):
             raise ValueError("Button links must start with https://")
-        return discord.ui.Button(style=discord.ButtonStyle.link, label=label[:80], url=url)
+        return discord.ui.Button(
+            style=discord.ButtonStyle.link, label=label[:80] or None, emoji=emoji, url=url
+        )
 
     check_action(action, ctx)
     style = STYLES.get(b.get("style"), discord.ButtonStyle.secondary)
     custom_id = f"m:{ctx['message_id']}:{b['id']}"
-    return discord.ui.Button(style=style, label=label[:80], custom_id=custom_id)
+    return discord.ui.Button(style=style, label=label[:80] or None, emoji=emoji, custom_id=custom_id)
 
 
 def build_dropdown(block, ctx):
@@ -84,6 +100,7 @@ def build_dropdown(block, ctx):
                 label=label[:100],
                 value=str(o["id"]),
                 description=description[:100] or None,
+                emoji=make_emoji(o.get("emoji")),
             )
         )
     placeholder = str(block.get("placeholder") or "Choose an option...")[:150]
