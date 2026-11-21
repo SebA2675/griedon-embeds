@@ -11,6 +11,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
+import access
 import db
 import interactions
 from routes import make_router
@@ -67,13 +68,14 @@ def read_token(token):
         return None
 
 
-def require_owner(authorization):
+def require_user(authorization):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Not logged in")
     data = read_token(authorization[7:])
-    if not data or data.get("sub") != OWNER_ID:
+    sub = str((data or {}).get("sub", ""))
+    if not sub.isdigit():
         raise HTTPException(401, "Invalid login")
-    return data["sub"]
+    return sub
 
 
 app = FastAPI()
@@ -124,18 +126,26 @@ async def callback(code: str = "", state: str = ""):
             if resp.status != 200:
                 raise HTTPException(400, "Could not read your Discord account")
             user = await resp.json()
-    if str(user["id"]) != OWNER_ID:
-        raise HTTPException(403, "This dashboard is private")
-    pass_token = make_token(OWNER_ID, 60 * 24 * 7)
+    user_id = str(user["id"])
+    if user_id != OWNER_ID:
+        mine = await access.accessible_guilds(client, user_id, OWNER_ID)
+        if not mine:
+            return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#error=noaccess")
+    pass_token = make_token(user_id, 60 * 24 * 7)
     return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#token={pass_token}")
 
 
 @app.get("/me")
 async def me(authorization: str = Header(default=None)):
-    return {"user_id": require_owner(authorization)}
+    uid = require_user(authorization)
+    if uid != OWNER_ID:
+        mine = await access.accessible_guilds(client, uid, OWNER_ID)
+        if not mine:
+            raise HTTPException(403, "You need to be an Administrator of a server where this bot is installed.")
+    return {"user_id": uid, "is_owner": uid == OWNER_ID}
 
 
-app.include_router(make_router(require_owner, lambda: client))
+app.include_router(make_router(require_user, lambda: client, OWNER_ID))
 
 
 class EmbedBot(discord.Client):
@@ -146,8 +156,28 @@ class EmbedBot(discord.Client):
         asyncio.create_task(self.api_server.serve())
         print(f"API listening on port {port}")
 
+    async def leave_unapproved(self, guild):
+        db.add_pending(str(guild.id), guild.name)
+        print(f"Leaving unapproved server {guild.name} ({guild.id})")
+        try:
+            await guild.leave()
+        except discord.HTTPException as err:
+            print("Could not leave:", err)
+
     async def on_ready(self):
         print(f"Online as {self.user}")
+        if db.allowed_count() == 0:
+            for g in self.guilds:
+                db.allow_guild(str(g.id), g.name)
+            print("Approved all servers the bot is currently in (first run).")
+        allowed = set(db.list_allowed_ids())
+        for g in list(self.guilds):
+            if str(g.id) not in allowed:
+                await self.leave_unapproved(g)
+
+    async def on_guild_join(self, guild):
+        if str(guild.id) not in set(db.list_allowed_ids()):
+            await self.leave_unapproved(guild)
 
     async def on_interaction(self, interaction):
         await interactions.handle(interaction)
