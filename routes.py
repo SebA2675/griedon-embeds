@@ -186,4 +186,23 @@ def make_router(require_owner, get_client):
             raise discord_error(err)
         return db.get_message(message_id)
 
+    @router.delete("/messages/{message_id}/posted")
+    async def delete_posted(message_id: int, authorization: str = Header(default=None)):
+        require_owner(authorization)
+        found = db.get_message(message_id)
+        if not found:
+            raise HTTPException(404, "Message not found")
+        if not found["posted_message_id"]:
+            raise HTTPException(400, "This message hasn't been posted yet")
+        channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
+        try:
+            target = await channel.fetch_message(int(found["posted_message_id"]))
+            await target.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as err:
+            raise discord_error(err)
+        db.clear_posted(message_id)
+        return db.get_message(message_id)
+
     return router
