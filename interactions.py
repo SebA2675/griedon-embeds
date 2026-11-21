@@ -112,6 +112,10 @@ async def handle(interaction):
         if not message:
             await say(interaction, "This message was deleted from the dashboard.")
             return
+        gid = message.get("guild_id")
+        if gid and str(interaction.guild_id) != str(gid):
+            await say(interaction, "This message belongs to another server.")
+            return
         layout = message["layout"]
         if data.get("component_type") == 3:
             values = data.get("values") or []
