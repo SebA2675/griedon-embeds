@@ -25,6 +25,9 @@ def check_layout(layout):
     replies = layout.get("replies", [])
     if not isinstance(replies, list) or len(replies) > 25:
         raise HTTPException(400, "replies must be a list of at most 25")
+    forms = layout.get("forms", [])
+    if not isinstance(forms, list) or len(forms) > 25:
+        raise HTTPException(400, "forms must be a list of at most 25")
     if len(json.dumps(layout)) > 200000:
         raise HTTPException(400, "Message is too large")
 
@@ -133,6 +136,20 @@ def make_router(require_owner, get_client):
                 continue
             can = bool(me.guild_permissions.manage_roles and role < me.top_role)
             result.append({"id": str(role.id), "name": role.name, "assignable": can})
+        return result
+
+    @router.get("/emojis")
+    def all_emojis(authorization: str = Header(default=None)):
+        require_owner(authorization)
+        result = []
+        for g in get_client().guilds:
+            items = [
+                {"id": str(e.id), "name": e.name, "animated": e.animated}
+                for e in g.emojis
+                if e.available
+            ]
+            if items:
+                result.append({"guild_id": str(g.id), "guild_name": g.name, "emojis": items})
         return result
 
     @router.post("/messages/{message_id}/post")
