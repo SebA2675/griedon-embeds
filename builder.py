@@ -116,6 +116,21 @@ def build_dropdown(block, ctx):
     return row
 
 
+def build_section(block, ctx):
+    content = str(block.get("content", "")).strip()
+    if not content:
+        raise ValueError("A Text + side part has no text")
+    text = discord.ui.TextDisplay(content)
+    if block.get("side") == "thumbnail":
+        url = str(block.get("image", "")).strip()
+        if not url.startswith("https://"):
+            raise ValueError("A thumbnail link must start with https://")
+        accessory = discord.ui.Thumbnail(url)
+    else:
+        accessory = build_button(block.get("button") or {}, ctx)
+    return discord.ui.Section(text, accessory=accessory)
+
+
 def build_item(block, ctx):
     kind = block.get("type")
 
@@ -124,6 +139,9 @@ def build_item(block, ctx):
         if not content:
             raise ValueError("A text part is empty")
         return discord.ui.TextDisplay(content)
+
+    if kind == "section":
+        return build_section(block, ctx)
 
     if kind == "images":
         urls = [str(u).strip() for u in block.get("urls", []) if str(u).strip()]
