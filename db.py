@@ -94,3 +94,9 @@ def set_posted(message_id, guild_id, channel_id, posted_message_id):
             (guild_id, channel_id, posted_message_id, message_id),
         )
         conn.commit()
+
+
+def clear_posted(message_id):
+    with closing(connect()) as conn:
+        conn.execute("UPDATE messages SET posted_message_id = NULL WHERE id = ?", (message_id,))
+        conn.commit()
