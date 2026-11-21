@@ -8,11 +8,14 @@ from pydantic import BaseModel
 import access
 import builder
 import db
+import timeutil
 
 MAX_PER_GUILD = 200
 MAX_TEMPLATES = 100
 MAX_IMPORT_ITEMS = 100
 MAX_IMPORT_BYTES = 3000000
+MAX_SCHEDULES_PER_MESSAGE = 20
+MAX_SCHEDULES_PER_GUILD = 100
 
 
 class MessageIn(BaseModel):
@@ -32,6 +35,16 @@ class AllowIn(BaseModel):
 
 class ImportIn(BaseModel):
     data: dict
+
+
+class ScheduleIn(BaseModel):
+    action: str
+    channel_id: str = ""
+    run_date: str
+    run_time: str
+    tz: str
+    repeat: str = "once"
+    replace_previous: bool = False
 
 
 def check_layout(layout):
@@ -285,6 +298,55 @@ def make_router(require_user, get_client, owner_id):
         if not found:
             raise HTTPException(404, "Version not found")
         return found
+
+    # ----- Schedules -----
+
+    @router.get("/messages/{message_id}/schedules")
+    async def list_schedules(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        return db.list_schedules(message_id)
+
+    @router.post("/messages/{message_id}/schedules")
+    async def add_schedule(message_id: int, body: ScheduleIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        gid = found["guild_id"]
+        if not gid:
+            raise HTTPException(400, "Choose a server for this message first")
+        guild = await user_guild(uid, gid)
+        if body.action not in ("post", "update"):
+            raise HTTPException(400, "Unknown action")
+        if body.repeat not in ("once", "daily", "weekly"):
+            raise HTTPException(400, "Unknown repeat option")
+        channel_id = ""
+        if body.action == "post":
+            channel = find_channel(get_client(), gid, body.channel_id)
+            channel_id = str(channel.id)
+        check_form_channels(found["layout"], guild)
+        make_view(found["layout"], message_id)
+        try:
+            run_date, next_run = timeutil.first_run(body.run_date, body.run_time, body.tz, body.repeat)
+        except ValueError as err:
+            raise HTTPException(400, str(err))
+        if db.count_schedules_message(message_id) >= MAX_SCHEDULES_PER_MESSAGE:
+            raise HTTPException(400, "This message has too many schedules. Delete some first.")
+        if db.count_schedules_guild(gid) >= MAX_SCHEDULES_PER_GUILD:
+            raise HTTPException(400, "This server has reached the schedule limit")
+        return db.create_schedule(
+            message_id, gid, body.action, channel_id, run_date, body.run_time, body.tz,
+            body.repeat, body.replace_previous and body.action == "post", next_run,
+        )
+
+    @router.delete("/schedules/{schedule_id}")
+    async def remove_schedule(schedule_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = db.get_schedule(schedule_id)
+        if not found:
+            raise HTTPException(404, "Schedule not found")
+        await user_guild(uid, found["guild_id"])
+        db.delete_schedule(schedule_id)
+        return {"deleted": True}
 
     # ----- Export, backup, import -----
 
