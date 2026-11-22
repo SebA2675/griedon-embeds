@@ -176,7 +176,7 @@ async def callback(code: str = "", state: str = ""):
         mine = await access.accessible_guilds(client, user_id, OWNER_ID)
         if not mine:
             return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#error=noaccess")
-    pass_token = make_token(user_id, 60 * 24 * 7)
+    pass_token = make_token(user_id, 60 * 12)
     nonce = str(data.get("n", ""))
     return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#token={pass_token}&n={nonce}")
 
