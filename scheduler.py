@@ -1,3 +1,4 @@
+
 import asyncio
 import time
 
@@ -17,75 +18,139 @@ async def delete_previous(client, message):
         channel = client.get_channel(int(message["channel_id"]))
         if channel is None:
             return
-        target = await channel.fetch_message(int(message["posted_message_id"]))
+
+        target = await channel.fetch_message(
+            int(message["posted_message_id"])
+        )
         await target.delete()
+
     except (discord.HTTPException, ValueError, TypeError):
         pass
 
 
 async def run_schedule(client, s):
     message = db.get_message(s["message_id"])
+
     if not message:
         return "Failed: the message was deleted"
+
     if str(message["guild_id"] or "") != s["guild_id"]:
         return "Failed: the message was moved to another server"
+
     guild = client.get_guild(int(s["guild_id"]))
+
     if guild is None:
         return "Failed: the bot is not in that server any more"
+
     try:
         check_form_channels(message["layout"], guild)
         view = make_view(message["layout"], message["id"])
+
         if s["action"] == "post":
-            channel = find_channel(client, s["guild_id"], s["channel_id"])
+            channel = find_channel(
+                client, s["guild_id"], s["channel_id"]
+            )
+
             if s["replace_previous"] and message["posted_message_id"]:
                 await delete_previous(client, message)
-            sent = await channel.send(view=view)
-            db.set_posted(message["id"], s["guild_id"], str(channel.id), str(sent.id))
+
+            sent = await channel.send(**view)
+
+            db.set_posted(
+                message["id"],
+                s["guild_id"],
+                str(channel.id),
+                str(sent.id)
+            )
+
         else:
             if not message["posted_message_id"]:
                 return "Failed: this message hasn't been posted yet"
-            channel = find_channel(client, s["guild_id"], message["channel_id"])
-            target = await channel.fetch_message(int(message["posted_message_id"]))
-            await target.edit(view=view)
-        db.add_version(message["id"], message["name"], message["layout"])
+
+            channel = find_channel(
+                client, s["guild_id"], message["channel_id"]
+            )
+
+            target = await channel.fetch_message(
+                int(message["posted_message_id"])
+            )
+
+            await target.edit(**view)
+
+        db.add_version(
+            message["id"],
+            message["name"],
+            message["layout"]
+        )
+
         return "OK"
+
     except HTTPException as err:
         return "Failed: " + str(err.detail)[:200]
+
     except discord.NotFound:
         return "Failed: the posted message no longer exists"
+
     except discord.HTTPException as err:
         return "Failed: Discord refused it (" + str(err)[:150] + ")"
 
 
 def finish(s, status):
     now = int(time.time())
+
     if s["repeat"] == "once":
-        db.finish_schedule(s["id"], now, status, None, s["run_date"], False)
+        db.finish_schedule(
+            s["id"], now, status, None, s["run_date"], False
+        )
         return
+
     try:
-        new_date, next_run = timeutil.advance(s["run_date"], s["run_time"], s["tz"], s["repeat"], now)
-        db.finish_schedule(s["id"], now, status, next_run, new_date, True)
+        new_date, next_run = timeutil.advance(
+            s["run_date"],
+            s["run_time"],
+            s["tz"],
+            s["repeat"],
+            now
+        )
+
+        db.finish_schedule(
+            s["id"], now, status, next_run, new_date, True
+        )
+
     except ValueError:
-        db.finish_schedule(s["id"], now, status + " (schedule stopped)", None, s["run_date"], False)
+        db.finish_schedule(
+            s["id"],
+            now,
+            status + " (schedule stopped)",
+            None,
+            s["run_date"],
+            False
+        )
 
 
 async def tick(client):
     now = int(time.time())
+
     for s in db.due_schedules(now):
         if now - s["next_run"] > MAX_LATE_SECONDS:
             status = "Skipped: the bot was offline at the scheduled time"
         else:
             status = await run_schedule(client, s)
+
         finish(s, status)
+
         print(f"Schedule {s['id']}: {status}")
 
 
 async def run_loop(client):
     await client.wait_until_ready()
     print("Scheduler started.")
+
     while not client.is_closed():
         try:
             await tick(client)
+
         except Exception as err:
             print("Scheduler error:", err)
+
         await asyncio.sleep(CHECK_SECONDS)
