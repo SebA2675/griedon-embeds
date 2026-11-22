@@ -89,6 +89,20 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS webhook_personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                avatar_url TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "webhook_id" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN webhook_id TEXT")
         rows = conn.execute("SELECT id, layout_json FROM messages WHERE guild_id IS NULL").fetchall()
         for row in rows:
             try:
@@ -123,6 +137,7 @@ def to_dict(row, full=True):
         "guild_id": row["guild_id"],
         "channel_id": row["channel_id"],
         "posted_message_id": row["posted_message_id"],
+        "webhook_id": row["webhook_id"],
         "updated_at": row["updated_at"],
         "changed": is_changed(row["id"]) if row["posted_message_id"] else False,
     }
@@ -186,10 +201,11 @@ def update_message(message_id, name, layout, guild_id):
                 updated_at = ?,
                 posted_message_id = CASE WHEN guild_id = ? THEN posted_message_id ELSE NULL END,
                 channel_id = CASE WHEN guild_id = ? THEN channel_id ELSE NULL END,
+                webhook_id = CASE WHEN guild_id = ? THEN webhook_id ELSE NULL END,
                 guild_id = ?
             WHERE id = ?
             """,
-            (name, json.dumps(layout), int(time.time()), guild_id, guild_id, guild_id, message_id),
+            (name, json.dumps(layout), int(time.time()), guild_id, guild_id, guild_id, guild_id, message_id),
         )
         conn.commit()
         changed = cur.rowcount
@@ -208,15 +224,24 @@ def delete_message(message_id):
 def set_posted(message_id, guild_id, channel_id, posted_message_id):
     with closing(connect()) as conn:
         conn.execute(
-            "UPDATE messages SET guild_id = ?, channel_id = ?, posted_message_id = ? WHERE id = ?",
+            "UPDATE messages SET guild_id = ?, channel_id = ?, posted_message_id = ?, webhook_id = NULL WHERE id = ?",
             (guild_id, channel_id, posted_message_id, message_id),
+        )
+        conn.commit()
+
+
+def set_posted_via_webhook(message_id, guild_id, channel_id, posted_message_id, webhook_id):
+    with closing(connect()) as conn:
+        conn.execute(
+            "UPDATE messages SET guild_id = ?, channel_id = ?, posted_message_id = ?, webhook_id = ? WHERE id = ?",
+            (guild_id, channel_id, posted_message_id, webhook_id, message_id),
         )
         conn.commit()
 
 
 def clear_posted(message_id):
     with closing(connect()) as conn:
-        conn.execute("UPDATE messages SET posted_message_id = NULL WHERE id = ?", (message_id,))
+        conn.execute("UPDATE messages SET posted_message_id = NULL, webhook_id = NULL WHERE id = ?", (message_id,))
         conn.commit()
 
 
@@ -470,3 +495,52 @@ def remove_pending(guild_id):
     with closing(connect()) as conn:
         conn.execute("DELETE FROM pending_guilds WHERE guild_id = ?", (guild_id,))
         conn.commit()
+
+
+# ---------- Webhook presets ----------
+
+def persona_dict(row):
+    return {
+        "id": row["id"],
+        "guild_id": row["guild_id"],
+        "name": row["name"],
+        "avatar_url": row["avatar_url"] or "",
+    }
+
+
+def list_personas(guild_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM webhook_personas WHERE guild_id = ? ORDER BY name COLLATE NOCASE", (guild_id,)
+        ).fetchall()
+    return [persona_dict(r) for r in rows]
+
+
+def count_personas(guild_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM webhook_personas WHERE guild_id = ?", (guild_id,)).fetchone()
+    return row["n"]
+
+
+def get_persona(persona_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM webhook_personas WHERE id = ?", (persona_id,)).fetchone()
+    return persona_dict(row) if row else None
+
+
+def create_persona(guild_id, name, avatar_url):
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO webhook_personas (guild_id, name, avatar_url, created_at) VALUES (?, ?, ?, ?)",
+            (guild_id, name, avatar_url, int(time.time())),
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+    return get_persona(new_id)
+
+
+def delete_persona(persona_id):
+    with closing(connect()) as conn:
+        cur = conn.execute("DELETE FROM webhook_personas WHERE id = ?", (persona_id,))
+        conn.commit()
+        return cur.rowcount > 0

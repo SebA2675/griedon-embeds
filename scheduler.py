@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 import db
 import timeutil
+import webhooks
 from routes import SAFE_MENTIONS, check_form_channels, find_channel, make_view
 
 CHECK_SECONDS = 30
@@ -74,14 +75,19 @@ async def run_schedule(client, s):
                 client, s["guild_id"], message["channel_id"]
             )
 
-            target = await channel.fetch_message(
-                int(message["posted_message_id"])
-            )
+            if message["webhook_id"]:
+                await webhooks.edit(
+                    client, channel, message["webhook_id"], message["posted_message_id"], view, SAFE_MENTIONS
+                )
+            else:
+                target = await channel.fetch_message(
+                    int(message["posted_message_id"])
+                )
 
-            await target.edit(
-                **view,
-                allowed_mentions=SAFE_MENTIONS
-            )
+                await target.edit(
+                    **view,
+                    allowed_mentions=SAFE_MENTIONS
+                )
 
         db.add_version(
             message["id"],

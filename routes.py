@@ -11,6 +11,7 @@ import access
 import builder
 import db
 import timeutil
+import webhooks
 
 MAX_PER_GUILD = 200
 MAX_TEMPLATES = 100
@@ -25,6 +26,7 @@ SAFE_MENTIONS = discord.AllowedMentions(
     users=True,
     replied_user=False
 )
+MAX_PERSONAS = 25
 
 
 class MessageIn(BaseModel):
@@ -54,6 +56,17 @@ class ScheduleIn(BaseModel):
     tz: str
     repeat: str = "once"
     replace_previous: bool = False
+
+
+class PersonaIn(BaseModel):
+    name: str
+    avatar_url: str = ""
+
+
+class HookSendIn(BaseModel):
+    guild_id: str
+    channel_id: str
+    persona_id: int
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9\_-]{1,40}$")
@@ -512,23 +525,24 @@ def make_router(require_user, get_client, owner_id):
     async def update_posted(message_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
-
         if not found["posted_message_id"]:
             raise HTTPException(400, "This message hasn't been posted yet")
-
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
         view = make_view(found["layout"], message_id)
-
         try:
-            target = await channel.fetch_message(int(found["posted_message_id"]))
-            await target.edit(**view, allowed_mentions=SAFE_MENTIONS)
+            if found["webhook_id"]:
+                await webhooks.edit(
+                    get_client(), channel, found["webhook_id"], found["posted_message_id"], view, SAFE_MENTIONS
+                )
+            else:
+                target = await channel.fetch_message(int(found["posted_message_id"]))
+                await target.edit(**view, allowed_mentions=SAFE_MENTIONS)
         except discord.NotFound:
             raise HTTPException(404, "The posted message was deleted. Post it again.")
         except discord.HTTPException as err:
             raise discord_error(err)
-
         db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
 
@@ -536,21 +550,75 @@ def make_router(require_user, get_client, owner_id):
     async def delete_posted(message_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
-
         if not found["posted_message_id"]:
             raise HTTPException(400, "This message hasn't been posted yet")
-
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
-
         try:
-            target = await channel.fetch_message(int(found["posted_message_id"]))
-            await target.delete()
+            if found["webhook_id"]:
+                await webhooks.delete(get_client(), channel, found["webhook_id"], found["posted_message_id"])
+            else:
+                target = await channel.fetch_message(int(found["posted_message_id"]))
+                await target.delete()
         except discord.NotFound:
             pass
         except discord.HTTPException as err:
             raise discord_error(err)
-
         db.clear_posted(message_id)
+        return db.get_message(message_id)
+
+    # ----- Webhook presets and sending -----
+
+    @router.get("/guilds/{guild_id}/personas")
+    async def list_personas(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        return db.list_personas(str(guild.id))
+
+    @router.post("/guilds/{guild_id}/personas")
+    async def add_persona(guild_id: str, body: PersonaIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        gid = str(guild.id)
+        name = body.name.strip()
+        if not 1 <= len(name) <= 80:
+            bad("The name must be 1 to 80 characters")
+        avatar = body.avatar_url.strip()
+        v_url(avatar, "Avatar link")
+        if db.count_personas(gid) >= MAX_PERSONAS:
+            raise HTTPException(400, "This server has reached the limit of webhook presets")
+        return db.create_persona(gid, name, avatar)
+
+    @router.delete("/personas/{persona_id}")
+    async def remove_persona(persona_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = db.get_persona(persona_id)
+        if not found:
+            raise HTTPException(404, "Preset not found")
+        await user_guild(uid, found["guild_id"])
+        db.delete_persona(persona_id)
+        return {"deleted": True}
+
+    @router.post("/messages/{message_id}/post-webhook")
+    async def post_webhook(message_id: int, body: HookSendIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        if not found["guild_id"]:
+            raise HTTPException(400, "Choose a server for this message first")
+        if str(body.guild_id) != found["guild_id"]:
+            raise HTTPException(400, "This message belongs to another server")
+        guild = await user_guild(uid, found["guild_id"])
+        persona = db.get_persona(body.persona_id)
+        if not persona or persona["guild_id"] != found["guild_id"]:
+            raise HTTPException(404, "Preset not found")
+        check_form_channels(found["layout"], guild)
+        channel = find_channel(get_client(), found["guild_id"], body.channel_id)
+        payload = make_view(found["layout"], message_id)
+        try:
+            hook, sent = await webhooks.send(get_client(), channel, payload, persona, SAFE_MENTIONS)
+        except discord.HTTPException as err:
+            raise discord_error(err)
+        db.set_posted_via_webhook(message_id, found["guild_id"], str(channel.id), str(sent.id), str(hook.id))
+        db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
 
     @router.post("/messages/{message_id}/test")
