@@ -91,6 +91,18 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS button_uses (
+                message_id INTEGER NOT NULL,
+                component_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                last_used INTEGER NOT NULL,
+                uses INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (message_id, component_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS webhook_personas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id TEXT NOT NULL,
@@ -217,6 +229,7 @@ def delete_message(message_id):
         cur = conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
         conn.execute("DELETE FROM versions WHERE message_id = ?", (message_id,))
         conn.execute("DELETE FROM schedules WHERE message_id = ?", (message_id,))
+        conn.execute("DELETE FROM button_uses WHERE message_id = ?", (message_id,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -494,6 +507,30 @@ def list_pending():
 def remove_pending(guild_id):
     with closing(connect()) as conn:
         conn.execute("DELETE FROM pending_guilds WHERE guild_id = ?", (guild_id,))
+        conn.commit()
+
+
+# ---------- Button rules (cooldown and one-use) ----------
+
+def get_use(message_id, component_id, user_id):
+    with closing(connect()) as conn:
+        return conn.execute(
+            "SELECT last_used, uses FROM button_uses WHERE message_id = ? AND component_id = ? AND user_id = ?",
+            (message_id, component_id, str(user_id)),
+        ).fetchone()
+
+
+def record_use(message_id, component_id, user_id):
+    with closing(connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO button_uses (message_id, component_id, user_id, last_used, uses)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(message_id, component_id, user_id)
+            DO UPDATE SET last_used = excluded.last_used, uses = uses + 1
+            """,
+            (message_id, component_id, str(user_id), int(time.time())),
+        )
         conn.commit()
 
 

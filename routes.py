@@ -132,6 +132,20 @@ def v_action(a):
         bad("Unknown action type")
 
 
+def v_rules(x):
+    roles = x.get("allowed_roles", [])
+    if not isinstance(roles, list) or len(roles) > 10:
+        bad("Too many allowed roles")
+    for r in roles:
+        if not isinstance(r, str) or not r.isdigit() or len(r) > 25:
+            bad("Invalid role")
+    cd = x.get("cooldown", 0)
+    if not isinstance(cd, int) or isinstance(cd, bool) or not 0 <= cd <= 86400:
+        bad("Cooldown must be 0 to 86400 seconds")
+    if not isinstance(x.get("once", False), bool):
+        bad("Invalid one-use setting")
+
+
 def v_button(b):
     if not isinstance(b, dict):
         bad("Invalid button")
@@ -141,6 +155,7 @@ def v_button(b):
         bad("Invalid button colour")
     v_emoji(b.get("emoji"))
     v_action(b.get("action") or {"type": "link", "url": b.get("url", "")})
+    v_rules(b)
 
 
 def v_block(b, in_box=False):
@@ -206,6 +221,7 @@ def v_block(b, in_box=False):
             v_str(o.get("description", ""), "Option description", 100)
             v_emoji(o.get("emoji"))
             v_action(o.get("action"))
+            v_rules(o)
 
 
 def v_embed(e):
@@ -316,6 +332,8 @@ def strip_guild_refs(x):
     elif isinstance(x, dict):
         if "role_id" in x:
             x["role_id"] = ""
+        if "allowed_roles" in x:
+            x["allowed_roles"] = []
         if "fields" in x and "channel_id" in x:
             x["channel_id"] = ""
         for value in x.values():

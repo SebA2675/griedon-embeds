@@ -5,10 +5,11 @@ PARAGRAPH_MAX = 600
 
 
 class FormModal(discord.ui.Modal):
-    def __init__(self, form):
+    def __init__(self, form, on_done=None):
         title = str(form.get("title") or form.get("name") or "Form").strip()[:45] or "Form"
         super().__init__(title=title, timeout=900)
         self.form = form
+        self.on_done = on_done
         self.inputs = []
         for field in form.get("fields", [])[:5]:
             paragraph = field.get("style") == "paragraph"
@@ -54,6 +55,9 @@ class FormModal(discord.ui.Modal):
         except discord.HTTPException:
             await interaction.response.send_message("Sorry, I couldn't deliver your answers.", ephemeral=True)
             return
+
+        if self.on_done:
+            self.on_done()
 
         thanks = str(self.form.get("thanks") or "Thanks! Your response was sent.")[:1900]
         await interaction.response.send_message(thanks, ephemeral=True)

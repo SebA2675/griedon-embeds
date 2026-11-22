@@ -1,3 +1,4 @@
+import time
 
 import discord
 
@@ -25,12 +26,10 @@ def find_button(layout, button_id):
             for btn in b.get("buttons", []):
                 if btn.get("id") == button_id:
                     return btn
-
         if b.get("type") == "section" and b.get("side") == "button":
             btn = b.get("button") or {}
             if btn.get("id") == button_id:
                 return btn
-
     return None
 
 
@@ -40,7 +39,6 @@ def find_option(layout, block_id, option_id):
             for o in b.get("options", []):
                 if o.get("id") == option_id:
                     return o
-
     return None
 
 
@@ -48,7 +46,6 @@ def find_form(layout, form_id):
     for f in layout.get("forms", []):
         if f.get("id") == form_id:
             return f
-
     return None
 
 
@@ -56,144 +53,143 @@ async def say(interaction, text):
     await interaction.response.send_message(text, ephemeral=True)
 
 
+def wait_text(seconds):
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds}s"
+
+
+def rule_problem(interaction, message, key, item):
+    allowed = [str(r) for r in (item.get("allowed_roles") or [])]
+    if allowed:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or interaction.guild is None:
+            return "This only works inside a server."
+        if not {str(r.id) for r in member.roles} & set(allowed):
+            names = []
+            for rid in allowed:
+                role = interaction.guild.get_role(int(rid)) if rid.isdigit() else None
+                if role:
+                    names.append(role.name)
+            return "You need one of these roles to use this: " + (", ".join(names) or "(role removed)")
+    cooldown = int(item.get("cooldown") or 0)
+    once = bool(item.get("once"))
+    if cooldown > 0 or once:
+        used = db.get_use(message["id"], key, interaction.user.id)
+        if used:
+            if once:
+                return "You can only use this once."
+            left = used["last_used"] + cooldown - int(time.time())
+            if left > 0:
+                return "Please wait " + wait_text(left) + " before using this again."
+    return None
+
+
 async def handle_role(interaction, action):
     guild = interaction.guild
-
     if guild is None or not isinstance(interaction.user, discord.Member):
         await say(interaction, "This only works inside a server.")
         return
-
     role = guild.get_role(int(action["role_id"]))
-
     if role is None:
         await say(interaction, "That role doesn't exist any more.")
         return
-
-    if (
-        role.permissions.administrator
-        or role.permissions.manage_guild
-        or role.permissions.manage_roles
-    ):
-        await say(
-            interaction,
-            "For safety, buttons can't give roles that have Administrator, Manage Server or Manage Roles."
-        )
-        return
-
     me = guild.me
-
     if not me.guild_permissions.manage_roles or role >= me.top_role or role.managed:
-        await say(
-            interaction,
-            "I can't manage that role. My role must be above it in Server Settings."
-        )
+        await say(interaction, "I can't manage that role. My role must be above it in Server Settings.")
         return
-
+    if role.permissions.administrator or role.permissions.manage_guild or role.permissions.manage_roles:
+        await say(interaction, "For safety, buttons can't give roles that have Administrator, Manage Server or Manage Roles.")
+        return
     member = interaction.user
     has = role in member.roles
     mode = action.get("mode", "toggle")
-
     if mode == "toggle":
         mode = "remove" if has else "add"
-
     if mode == "add":
         if has:
             await say(interaction, f"You already have the {role.name} role.")
             return
-
         await member.add_roles(role, reason="Dashboard role action")
         await say(interaction, f"Added the {role.name} role.")
-
     else:
         if not has:
             await say(interaction, f"You don't have the {role.name} role.")
             return
-
         await member.remove_roles(role, reason="Dashboard role action")
         await say(interaction, f"Removed the {role.name} role.")
 
 
-async def run_action(interaction, message, action):
+async def run_action(interaction, message, action, on_done=None):
     kind = action.get("type")
-
     if kind == "reply":
-        view = builder.build_reply_view(
-            message["layout"],
-            message["id"],
-            action.get("reply_id")
-        )
+        view = builder.build_reply_view(message["layout"], message["id"], action.get("reply_id"))
         await interaction.response.send_message(view=view, ephemeral=True)
-
     elif kind == "role":
         await handle_role(interaction, action)
-
     elif kind == "form":
         form = find_form(message["layout"], action.get("form_id"))
-
         if not form:
             await say(interaction, "This form was removed from the message.")
             return
-
-        await interaction.response.send_modal(forms.FormModal(form))
-
+        await interaction.response.send_modal(forms.FormModal(form, on_done))
     else:
         await say(interaction, "This has no action.")
+
+
+async def use_item(interaction, message, key, item):
+    problem = rule_problem(interaction, message, key, item)
+    if problem:
+        await say(interaction, problem)
+        return
+    action = item.get("action") or {}
+    counted = int(item.get("cooldown") or 0) > 0 or bool(item.get("once"))
+    if action.get("type") == "form":
+        done = None
+        if counted:
+            user_id = interaction.user.id
+            done = lambda: db.record_use(message["id"], key, user_id)
+        await run_action(interaction, message, action, done)
+        return
+    if counted:
+        db.record_use(message["id"], key, interaction.user.id)
+    await run_action(interaction, message, action)
 
 
 async def handle(interaction):
     if interaction.type != discord.InteractionType.component:
         return
-
     data = interaction.data or {}
     parts = data.get("custom_id", "").split(":")
-
     if len(parts) != 3 or parts[0] != "m" or not parts[1].isdigit():
         return
-
     try:
         message = db.get_message(int(parts[1]))
-
         if not message:
             await say(interaction, "This message was deleted from the dashboard.")
             return
-
         gid = message.get("guild_id")
-
         if gid and str(interaction.guild_id) != str(gid):
             await say(interaction, "This message belongs to another server.")
             return
-
         layout = message["layout"]
-
         if data.get("component_type") == 3:
             values = data.get("values") or []
             option = find_option(layout, parts[2], values[0]) if values else None
-
             if not option:
                 await say(interaction, "This option was removed from the message.")
                 return
-
-            await run_action(
-                interaction,
-                message,
-                option.get("action") or {}
-            )
-
+            await use_item(interaction, message, parts[2] + "." + str(option.get("id")), option)
         else:
             button = find_button(layout, parts[2])
-
             if not button:
                 await say(interaction, "This button was removed from the message.")
                 return
-
-            await run_action(
-                interaction,
-                message,
-                button.get("action") or {}
-            )
-
+            await use_item(interaction, message, parts[2], button)
     except ValueError as err:
         await say(interaction, "Could not open this: " + str(err))
-
     except discord.HTTPException as err:
         print("Interaction error:", err)
