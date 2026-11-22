@@ -282,6 +282,27 @@ def make_router(require_user, get_client, owner_id):
         db.clear_posted(message_id)
         return db.get_message(message_id)
 
+    @router.post("/messages/{message_id}/test")
+    async def test_send(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        if not found["guild_id"]:
+            raise HTTPException(400, "Choose a server for this message first")
+        guild = await user_guild(uid, found["guild_id"])
+        check_form_channels(found["layout"], guild)
+        payload = make_view(found["layout"], message_id)
+        try:
+            user = await get_client().fetch_user(int(uid))
+            await user.send(**payload)
+        except discord.Forbidden:
+            raise HTTPException(
+                400,
+                "I couldn't DM you. In Discord, allow direct messages from server members, then try again.",
+            )
+        except discord.HTTPException as err:
+            raise discord_error(err)
+        return {"ok": True}
+
     # ----- Version history -----
 
     @router.get("/messages/{message_id}/versions")
