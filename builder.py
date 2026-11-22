@@ -82,7 +82,7 @@ def build_button(b, ctx):
     return discord.ui.Button(style=style, label=label[:80] or None, emoji=emoji, custom_id=custom_id)
 
 
-def build_dropdown(block, ctx):
+def build_select(block, ctx):
     options = block.get("options", [])
     if not options:
         raise ValueError("A dropdown has no options")
@@ -111,8 +111,12 @@ def build_dropdown(block, ctx):
         min_values=1,
         max_values=1,
     )
+    return select
+
+
+def build_dropdown(block, ctx):
     row = discord.ui.ActionRow()
-    row.add_item(select)
+    row.add_item(build_select(block, ctx))
     return row
 
 
@@ -218,3 +222,115 @@ def build_reply_view(layout, message_id, reply_id):
         if reply.get("id") == reply_id:
             return view_from_blocks(reply.get("blocks", []), ctx)
     raise ValueError("Reply not found")
+
+
+EMBED_TOTAL = 6000
+MAX_EMBEDS = 10
+MAX_FIELDS = 25
+
+
+def https_or_none(value, what):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if not value.startswith("https://"):
+        raise ValueError(what + " must start with https://")
+    return value
+
+
+def build_embed(e):
+    title = str(e.get("title") or "").strip()
+    desc = str(e.get("description") or "").strip()
+    embed = discord.Embed(
+        title=title or None,
+        description=desc or None,
+        url=https_or_none(e.get("url"), "An embed link"),
+        colour=colour_from_hex(e.get("color")),
+    )
+    size = len(title) + len(desc)
+    author = str(e.get("author_name") or "").strip()
+    if author:
+        embed.set_author(
+            name=author[:256],
+            url=https_or_none(e.get("author_url"), "An author link"),
+            icon_url=https_or_none(e.get("author_icon"), "An author icon link"),
+        )
+        size += len(author)
+    fields = e.get("fields", [])
+    if len(fields) > MAX_FIELDS:
+        raise ValueError("Max 25 fields in an embed")
+    for f in fields:
+        name = str(f.get("name") or "").strip()
+        value = str(f.get("value") or "").strip()
+        if not name or not value:
+            raise ValueError("An embed field needs a name and a value")
+        embed.add_field(name=name, value=value, inline=bool(f.get("inline")))
+        size += len(name) + len(value)
+    image = https_or_none(e.get("image"), "An embed image link")
+    if image:
+        embed.set_image(url=image)
+    thumb = https_or_none(e.get("thumbnail"), "An embed thumbnail link")
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    footer = str(e.get("footer_text") or "").strip()
+    if footer:
+        embed.set_footer(text=footer, icon_url=https_or_none(e.get("footer_icon"), "A footer icon link"))
+        size += len(footer)
+    if e.get("timestamp"):
+        embed.timestamp = discord.utils.utcnow()
+    if not (title or desc or author or footer or fields or image or thumb):
+        raise ValueError("An embed is empty")
+    return embed, size
+
+
+def build_classic(layout, ctx):
+    content = str(layout.get("content") or "").strip()
+    if len(content) > 2000:
+        raise ValueError("Message text is over 2000 characters")
+    raw = layout.get("embeds", [])
+    if len(raw) > MAX_EMBEDS:
+        raise ValueError("Max 10 embeds")
+    embeds = []
+    total = 0
+    for e in raw:
+        embed, size = build_embed(e)
+        embeds.append(embed)
+        total += size
+    if total > EMBED_TOTAL:
+        raise ValueError("Embeds are over 6000 characters in total")
+    blocks = layout.get("blocks", [])
+    if len(blocks) > 5:
+        raise ValueError("Max 5 rows of buttons and dropdowns")
+    view = discord.ui.View(timeout=None)
+    for i, block in enumerate(blocks):
+        kind = block.get("type")
+        if kind == "button_row":
+            buttons = block.get("buttons", [])
+            if not buttons:
+                raise ValueError("A button row is empty")
+            if len(buttons) > MAX_BUTTONS:
+                raise ValueError("Max 5 buttons per row")
+            for b in buttons:
+                item = build_button(b, ctx)
+                item.row = i
+                view.add_item(item)
+        elif kind == "dropdown":
+            item = build_select(block, ctx)
+            item.row = i
+            view.add_item(item)
+        else:
+            raise ValueError("Classic messages only support buttons and dropdowns")
+    if not content and not embeds:
+        raise ValueError("Add some text or an embed")
+    return {"content": content or None, "embeds": embeds, "view": view}
+
+
+def build_payload(layout, message_id):
+    ctx = make_ctx(layout, message_id)
+    for form in layout.get("forms", []):
+        check_form(form)
+    for reply in layout.get("replies", []):
+        view_from_blocks(reply.get("blocks", []), ctx)
+    if layout.get("kind") == "classic":
+        return build_classic(layout, ctx)
+    return {"view": view_from_blocks(layout.get("blocks", []), ctx)}
