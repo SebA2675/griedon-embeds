@@ -39,14 +39,14 @@ async def run_schedule(client, s):
             channel = find_channel(client, s["guild_id"], s["channel_id"])
             if s["replace_previous"] and message["posted_message_id"]:
                 await delete_previous(client, message)
-            sent = await channel.send(view=view)
+            sent = await channel.send(**view)
             db.set_posted(message["id"], s["guild_id"], str(channel.id), str(sent.id))
         else:
             if not message["posted_message_id"]:
                 return "Failed: this message hasn't been posted yet"
             channel = find_channel(client, s["guild_id"], message["channel_id"])
             target = await channel.fetch_message(int(message["posted_message_id"]))
-            await target.edit(view=view)
+            await target.edit(**view)
         db.add_version(message["id"], message["name"], message["layout"])
         return "OK"
     except HTTPException as err:

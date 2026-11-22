@@ -212,6 +212,10 @@ def build_view(layout, message_id):
     return view_from_blocks(layout.get("blocks", []), ctx)
 
 
+def build_payload(layout, message_id):
+    return {"view": build_view(layout, message_id)}
+
+
 def build_reply_view(layout, message_id, reply_id):
     ctx = make_ctx(layout, message_id)
     for reply in layout.get("replies", []):

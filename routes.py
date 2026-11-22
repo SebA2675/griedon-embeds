@@ -80,7 +80,7 @@ def strip_guild_refs(x):
 
 def make_view(layout, message_id):
     try:
-        return builder.build_view(layout, message_id)
+        return builder.build_payload(layout, message_id)
     except ValueError as err:
         raise HTTPException(400, str(err))
 
@@ -238,7 +238,7 @@ def make_router(require_user, get_client, owner_id):
         channel = find_channel(get_client(), found["guild_id"], body.channel_id)
         view = make_view(found["layout"], message_id)
         try:
-            sent = await channel.send(view=view)
+            sent = await channel.send(**view)
         except discord.HTTPException as err:
             raise discord_error(err)
         db.set_posted(message_id, found["guild_id"], str(channel.id), str(sent.id))
@@ -257,7 +257,7 @@ def make_router(require_user, get_client, owner_id):
         view = make_view(found["layout"], message_id)
         try:
             target = await channel.fetch_message(int(found["posted_message_id"]))
-            await target.edit(view=view)
+            await target.edit(**view)
         except discord.NotFound:
             raise HTTPException(404, "The posted message was deleted. Post it again.")
         except discord.HTTPException as err:
@@ -290,7 +290,10 @@ def make_router(require_user, get_client, owner_id):
             raise HTTPException(400, "Choose a server for this message first")
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
-        payload = make_view(found["layout"], message_id)
+        try:
+            payload = builder.build_payload(found["layout"], message_id)
+        except ValueError as err:
+            raise HTTPException(400, str(err))
         try:
             user = await get_client().fetch_user(int(uid))
             await user.send(**payload)
