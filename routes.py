@@ -1,3 +1,4 @@
+
 import json
 import re
 import time
@@ -17,6 +18,13 @@ MAX_IMPORT_ITEMS = 100
 MAX_IMPORT_BYTES = 3000000
 MAX_SCHEDULES_PER_MESSAGE = 20
 MAX_SCHEDULES_PER_GUILD = 100
+
+SAFE_MENTIONS = discord.AllowedMentions(
+    everyone=False,
+    roles=True,
+    users=True,
+    replied_user=False
+)
 
 
 class MessageIn(BaseModel):
@@ -48,7 +56,7 @@ class ScheduleIn(BaseModel):
     replace_previous: bool = False
 
 
-ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+ID_RE = re.compile(r"^[A-Za-z0-9\_-]{1,40}$")
 BLOCK_TYPES = {"text", "section", "images", "divider", "box", "button_row", "dropdown"}
 BUTTON_STYLES = {"grey", "blue", "green", "red"}
 
@@ -129,8 +137,10 @@ def v_block(b, in_box=False):
     kind = b.get("type")
     if kind not in BLOCK_TYPES:
         bad("Unknown part type")
+
     if kind == "text":
         v_str(b.get("content", ""), "Text", 8000)
+
     elif kind == "section":
         v_str(b.get("content", ""), "Text", 8000)
         side = b.get("side", "button")
@@ -140,15 +150,18 @@ def v_block(b, in_box=False):
             v_url(b.get("image", ""), "Thumbnail link")
         else:
             v_button(b.get("button"))
+
     elif kind == "images":
         urls = b.get("urls", [])
         if not isinstance(urls, list) or len(urls) > 20:
             bad("Too many images in one part")
         for u in urls:
             v_url(u, "Image link")
+
     elif kind == "divider":
         if b.get("spacing", "small") not in ("small", "large"):
             bad("Invalid divider spacing")
+
     elif kind == "box":
         if in_box:
             bad("A box can't contain another box")
@@ -159,12 +172,14 @@ def v_block(b, in_box=False):
             bad("Too many parts in a box")
         for c in kids:
             v_block(c, True)
+
     elif kind == "button_row":
         btns = b.get("buttons", [])
         if not isinstance(btns, list) or len(btns) > 10:
             bad("Too many buttons in a row")
         for x in btns:
             v_button(x)
+
     elif kind == "dropdown":
         v_str(b.get("placeholder", ""), "Placeholder", 150)
         opts = b.get("options", [])
@@ -184,15 +199,24 @@ def v_embed(e):
     if not isinstance(e, dict):
         bad("Invalid embed")
     v_id(e.get("id"), "embed")
-    for key, limit in (("title", 256), ("description", 4096), ("author_name", 256), ("footer_text", 2048)):
+    for key, limit in (
+        ("title", 256),
+        ("description", 4096),
+        ("author_name", 256),
+        ("footer_text", 2048)
+    ):
         v_str(e.get(key, ""), "Embed " + key.replace("_", " "), limit)
+
     for key in ("url", "author_url", "author_icon", "image", "thumbnail", "footer_icon"):
         v_url(e.get(key, ""), "Embed link")
+
     if not re.match(r"^#[0-9a-fA-F]{6}$", str(e.get("color", "#5865F2"))):
         bad("Invalid embed colour")
+
     fields = e.get("fields", [])
     if not isinstance(fields, list) or len(fields) > 25:
         bad("Too many embed fields")
+
     for f in fields:
         if not isinstance(f, dict):
             bad("Invalid embed field")
@@ -213,10 +237,13 @@ def check_layout(layout):
         bad("layout must be an object")
     if len(json.dumps(layout)) > 200000:
         bad("Message is too large")
+
     v_digits(str(layout.get("guild_id") or ""), "server id")
+
     kind = layout.get("kind", "layout")
     if kind not in ("layout", "classic"):
         bad("Unknown message kind")
+
     if kind == "classic":
         v_str(layout.get("content", ""), "Message text", 2000)
         embeds = layout.get("embeds", [])
@@ -224,19 +251,24 @@ def check_layout(layout):
             bad("A message can have at most 10 embeds")
         for e in embeds:
             v_embed(e)
+
     v_blocks(layout.get("blocks"))
+
     replies = layout.get("replies", [])
     if not isinstance(replies, list) or len(replies) > 25:
         bad("replies must be a list of at most 25")
+
     for r in replies:
         if not isinstance(r, dict):
             bad("Invalid reply")
         v_id(r.get("id"), "reply")
         v_str(r.get("name", ""), "Reply name", 100)
         v_blocks(r.get("blocks", []))
+
     forms = layout.get("forms", [])
     if not isinstance(forms, list) or len(forms) > 25:
         bad("forms must be a list of at most 25")
+
     for f in forms:
         if not isinstance(f, dict):
             bad("Invalid form")
@@ -245,9 +277,11 @@ def check_layout(layout):
         v_str(f.get("title", ""), "Form title", 100)
         v_str(f.get("thanks", ""), "Thank-you text", 2000)
         v_digits(f.get("channel_id", ""), "channel")
+
         fields = f.get("fields", [])
         if not isinstance(fields, list) or len(fields) > 10:
             bad("Too many form questions")
+
         for q in fields:
             if not isinstance(q, dict):
                 bad("Invalid question")
@@ -287,11 +321,14 @@ def find_channel(client, guild_id, channel_id):
         channel = client.get_channel(int(channel_id))
     except (TypeError, ValueError):
         raise HTTPException(400, "Bad channel id")
+
     if not isinstance(channel, discord.TextChannel) or str(channel.guild.id) != str(guild_id):
         raise HTTPException(404, "Channel not found")
+
     perms = channel.permissions_for(channel.guild.me)
     if not (perms.view_channel and perms.send_messages):
         raise HTTPException(403, "The bot can't send messages in that channel")
+
     return channel
 
 
@@ -399,17 +436,36 @@ def make_router(require_user, get_client, owner_id):
         guild = await user_guild(uid, guild_id)
         me = guild.me
         result = []
+
         for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
             if role.is_default() or role.managed:
                 continue
+
             can = bool(me.guild_permissions.manage_roles and role < me.top_role)
-            result.append({"id": str(role.id), "name": role.name, "assignable": can})
+
+            p = role.permissions
+            dangerous = bool(
+                p.administrator
+                or p.manage_guild
+                or p.manage_roles
+                or p.ban_members
+                or p.kick_members
+            )
+
+            result.append({
+                "id": str(role.id),
+                "name": role.name,
+                "assignable": can,
+                "dangerous": dangerous
+            })
+
         return result
 
     @router.get("/emojis")
     async def all_emojis(authorization: str = Header(default=None)):
         uid = require_user(authorization)
         result = []
+
         for g in await access.accessible_guilds(get_client(), uid, owner_id):
             items = [
                 {"id": str(e.id), "name": e.name, "animated": e.animated}
@@ -417,7 +473,12 @@ def make_router(require_user, get_client, owner_id):
                 if e.available
             ]
             if items:
-                result.append({"guild_id": str(g.id), "guild_name": g.name, "emojis": items})
+                result.append({
+                    "guild_id": str(g.id),
+                    "guild_name": g.name,
+                    "emojis": items
+                })
+
         return result
 
     # ----- Posting -----
@@ -426,18 +487,23 @@ def make_router(require_user, get_client, owner_id):
     async def post_message(message_id: int, body: SendIn, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
+
         if not found["guild_id"]:
             raise HTTPException(400, "Choose a server for this message first")
+
         if str(body.guild_id) != found["guild_id"]:
             raise HTTPException(400, "This message belongs to another server")
+
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], body.channel_id)
         view = make_view(found["layout"], message_id)
+
         try:
-            sent = await channel.send(**view)
+            sent = await channel.send(**view, allowed_mentions=SAFE_MENTIONS)
         except discord.HTTPException as err:
             raise discord_error(err)
+
         db.set_posted(message_id, found["guild_id"], str(channel.id), str(sent.id))
         db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
@@ -446,19 +512,23 @@ def make_router(require_user, get_client, owner_id):
     async def update_posted(message_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
+
         if not found["posted_message_id"]:
             raise HTTPException(400, "This message hasn't been posted yet")
+
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
         view = make_view(found["layout"], message_id)
+
         try:
             target = await channel.fetch_message(int(found["posted_message_id"]))
-            await target.edit(**view)
+            await target.edit(**view, allowed_mentions=SAFE_MENTIONS)
         except discord.NotFound:
             raise HTTPException(404, "The posted message was deleted. Post it again.")
         except discord.HTTPException as err:
             raise discord_error(err)
+
         db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
 
@@ -466,9 +536,12 @@ def make_router(require_user, get_client, owner_id):
     async def delete_posted(message_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
+
         if not found["posted_message_id"]:
             raise HTTPException(400, "This message hasn't been posted yet")
+
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
+
         try:
             target = await channel.fetch_message(int(found["posted_message_id"]))
             await target.delete()
@@ -476,6 +549,7 @@ def make_router(require_user, get_client, owner_id):
             pass
         except discord.HTTPException as err:
             raise discord_error(err)
+
         db.clear_posted(message_id)
         return db.get_message(message_id)
 
@@ -483,24 +557,29 @@ def make_router(require_user, get_client, owner_id):
     async def test_send(message_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
+
         if not found["guild_id"]:
             raise HTTPException(400, "Choose a server for this message first")
+
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
+
         try:
             payload = builder.build_payload(found["layout"], message_id)
         except ValueError as err:
             raise HTTPException(400, str(err))
+
         try:
             user = await get_client().fetch_user(int(uid))
             await user.send(**payload)
         except discord.Forbidden:
             raise HTTPException(
                 400,
-                "I couldn't DM you. In Discord, allow direct messages from server members, then try again.",
+                "I couldn't DM you. In Discord, allow direct messages from server members, then try again."
             )
         except discord.HTTPException as err:
             raise discord_error(err)
+
         return {"ok": True}
 
     # ----- Version history -----
@@ -533,38 +612,61 @@ def make_router(require_user, get_client, owner_id):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
         gid = found["guild_id"]
+
         if not gid:
             raise HTTPException(400, "Choose a server for this message first")
+
         guild = await user_guild(uid, gid)
+
         if body.action not in ("post", "update"):
             raise HTTPException(400, "Unknown action")
+
         if body.repeat not in ("once", "daily", "weekly"):
             raise HTTPException(400, "Unknown repeat option")
+
         channel_id = ""
+
         if body.action == "post":
             channel = find_channel(get_client(), gid, body.channel_id)
             channel_id = str(channel.id)
+
         check_form_channels(found["layout"], guild)
         make_view(found["layout"], message_id)
+
         try:
-            run_date, next_run = timeutil.first_run(body.run_date, body.run_time, body.tz, body.repeat)
+            run_date, next_run = timeutil.first_run(
+                body.run_date, body.run_time, body.tz, body.repeat
+            )
         except ValueError as err:
             raise HTTPException(400, str(err))
+
         if db.count_schedules_message(message_id) >= MAX_SCHEDULES_PER_MESSAGE:
             raise HTTPException(400, "This message has too many schedules. Delete some first.")
+
         if db.count_schedules_guild(gid) >= MAX_SCHEDULES_PER_GUILD:
             raise HTTPException(400, "This server has reached the schedule limit")
+
         return db.create_schedule(
-            message_id, gid, body.action, channel_id, run_date, body.run_time, body.tz,
-            body.repeat, body.replace_previous and body.action == "post", next_run,
+            message_id,
+            gid,
+            body.action,
+            channel_id,
+            run_date,
+            body.run_time,
+            body.tz,
+            body.repeat,
+            body.replace_previous and body.action == "post",
+            next_run
         )
 
     @router.delete("/schedules/{schedule_id}")
     async def remove_schedule(schedule_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = db.get_schedule(schedule_id)
+
         if not found:
             raise HTTPException(404, "Schedule not found")
+
         await user_guild(uid, found["guild_id"])
         db.delete_schedule(schedule_id)
         return {"deleted": True}
@@ -575,12 +677,13 @@ def make_router(require_user, get_client, owner_id):
     async def export_message(message_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
+
         return {
             "format": "embed-dashboard-message",
             "version": 1,
             "guild_id": found["guild_id"],
             "name": found["name"],
-            "layout": found["layout"],
+            "layout": found["layout"]
         }
 
     @router.get("/guilds/{guild_id}/backup")
@@ -588,13 +691,20 @@ def make_router(require_user, get_client, owner_id):
         uid = require_user(authorization)
         guild = await user_guild(uid, guild_id)
         gid = str(guild.id)
+
         return {
             "format": "embed-dashboard-backup",
             "version": 1,
             "guild_id": gid,
             "exported_at": int(time.time()),
-            "messages": [{"name": m["name"], "layout": m["layout"]} for m in db.list_messages_full(gid)],
-            "templates": [{"name": t["name"], "layout": t["layout"]} for t in db.list_templates_full(gid)],
+            "messages": [
+                {"name": m["name"], "layout": m["layout"]}
+                for m in db.list_messages_full(gid)
+            ],
+            "templates": [
+                {"name": t["name"], "layout": t["layout"]}
+                for t in db.list_templates_full(gid)
+            ]
         }
 
     @router.post("/guilds/{guild_id}/import")
@@ -603,12 +713,14 @@ def make_router(require_user, get_client, owner_id):
         guild = await user_guild(uid, guild_id)
         gid = str(guild.id)
         data = body.data
+
         if len(json.dumps(data)) > MAX_IMPORT_BYTES:
             raise HTTPException(400, "That file is too large")
+
         source = str(data.get("guild_id") or "")
         foreign = source != gid
-
         kind = data.get("format")
+
         if kind == "embed-dashboard-message":
             items = [{"name": data.get("name"), "layout": data.get("layout")}]
             temps = []
@@ -617,12 +729,16 @@ def make_router(require_user, get_client, owner_id):
             temps = data.get("templates", [])
         else:
             raise HTTPException(400, "This file isn't an export from this dashboard")
+
         if not isinstance(items, list) or not isinstance(temps, list):
             raise HTTPException(400, "The file is damaged")
+
         if len(items) > MAX_IMPORT_ITEMS or len(temps) > MAX_IMPORT_ITEMS:
             raise HTTPException(400, "Too many items in one file")
+
         if db.count_messages(gid) + len(items) > MAX_PER_GUILD:
             raise HTTPException(400, "This would go over the saved-message limit for this server")
+
         if db.count_templates(gid) + len(temps) > MAX_TEMPLATES:
             raise HTTPException(400, "This would go over the template limit for this server")
 
@@ -633,22 +749,32 @@ def make_router(require_user, get_client, owner_id):
                 if not isinstance(layout, dict):
                     raise HTTPException(400, "The file is damaged")
                 check_layout(layout)
-                ready.append((clean_name(entry.get("name") or "Imported message"), layout))
+                ready.append((
+                    clean_name(entry.get("name") or "Imported message"),
+                    layout
+                ))
             return ready
 
         ready_messages = prepare(items)
         ready_templates = prepare(temps)
+
         for name, layout in ready_messages:
             layout["guild_id"] = gid
             if foreign:
                 strip_guild_refs(layout)
             db.create_message(name, layout, gid)
+
         for name, layout in ready_templates:
             layout["guild_id"] = gid
             if foreign:
                 strip_guild_refs(layout)
             db.create_template(gid, name, layout)
-        return {"messages": len(ready_messages), "templates": len(ready_templates), "stripped": foreign}
+
+        return {
+            "messages": len(ready_messages),
+            "templates": len(ready_templates),
+            "stripped": foreign
+        }
 
     # ----- Templates -----
 
@@ -663,9 +789,12 @@ def make_router(require_user, get_client, owner_id):
         uid = require_user(authorization)
         guild = await user_guild(uid, guild_id)
         gid = str(guild.id)
+
         check_layout(body.layout)
+
         if db.count_templates(gid) >= MAX_TEMPLATES:
             raise HTTPException(400, "This server has reached the template limit")
+
         layout = dict(body.layout)
         layout["guild_id"] = gid
         return db.create_template(gid, clean_name(body.name), layout)
@@ -674,8 +803,10 @@ def make_router(require_user, get_client, owner_id):
     async def read_template(template_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = db.get_template(template_id)
+
         if not found:
             raise HTTPException(404, "Template not found")
+
         await user_guild(uid, found["guild_id"])
         return found
 
@@ -683,8 +814,10 @@ def make_router(require_user, get_client, owner_id):
     async def remove_template(template_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = db.get_template(template_id)
+
         if not found:
             raise HTTPException(404, "Template not found")
+
         await user_guild(uid, found["guild_id"])
         db.delete_template(template_id)
         return {"deleted": True}
@@ -696,30 +829,42 @@ def make_router(require_user, get_client, owner_id):
         require_owner_user(authorization)
         joined = {str(g.id): g.name for g in get_client().guilds}
         allowed = []
+
         for row in db.list_allowed():
             gid = row["guild_id"]
-            allowed.append({"id": gid, "name": joined.get(gid) or row["name"], "joined": gid in joined})
+            allowed.append({
+                "id": gid,
+                "name": joined.get(gid) or row["name"],
+                "joined": gid in joined
+            })
+
         return {"allowed": allowed, "pending": db.list_pending()}
 
     @router.post("/admin/allow")
     async def admin_allow(body: AllowIn, authorization: str = Header(default=None)):
         require_owner_user(authorization)
         gid = body.guild_id.strip()
+
         if not gid.isdigit():
             raise HTTPException(400, "A server ID is only numbers")
+
         db.allow_guild(gid, body.name.strip()[:100])
         return {"ok": True}
 
     @router.delete("/admin/allow/{guild_id}")
     async def admin_remove(guild_id: str, authorization: str = Header(default=None)):
         require_owner_user(authorization)
+
         if not guild_id.isdigit():
             raise HTTPException(400, "Bad server id")
+
         db.remove_allowed(guild_id)
         guild = get_client().get_guild(int(guild_id))
+
         if guild is not None:
             db.add_pending(guild_id, guild.name)
             await guild.leave()
+
         return {"ok": True}
 
     @router.delete("/admin/pending/{guild_id}")
