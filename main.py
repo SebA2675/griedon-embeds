@@ -1,6 +1,8 @@
 import os
+import re
 import time
 import asyncio
+from collections import defaultdict, deque
 from urllib.parse import urlencode
 
 import aiohttp
@@ -9,7 +11,7 @@ import jwt
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 import access
 import db
@@ -57,8 +59,9 @@ if missing:
     raise SystemExit("Missing settings: " + ", ".join(missing))
 
 
-def make_token(subject, minutes):
+def make_token(subject, minutes, extra=None):
     payload = {"sub": subject, "exp": int(time.time()) + minutes * 60}
+    payload.update(extra or {})
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
@@ -76,10 +79,49 @@ def require_user(authorization):
     sub = str((data or {}).get("sub", ""))
     if not sub.isdigit():
         raise HTTPException(401, "Invalid login")
+    if too_many("u:" + sub, 300):
+        raise HTTPException(429, "Too many requests. Slow down.")
     return sub
 
 
 app = FastAPI()
+
+MAX_BODY_BYTES = 4000000
+RATE_WINDOW = 60
+IP_LIMIT = 240
+AUTH_LIMIT = 20
+_hits = defaultdict(deque)
+
+
+def too_many(key, limit):
+    now = time.time()
+    if len(_hits) > 5000:
+        for k in [k for k, v in _hits.items() if not v or v[-1] < now - RATE_WINDOW]:
+            del _hits[k]
+    q = _hits[key]
+    while q and q[0] < now - RATE_WINDOW:
+        q.popleft()
+    if len(q) >= limit:
+        return True
+    q.append(now)
+    return False
+
+
+@app.middleware("http")
+async def guard(request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    size = request.headers.get("content-length", "")
+    if size.isdigit() and int(size) > MAX_BODY_BYTES:
+        return JSONResponse({"detail": "Request too large"}, status_code=413)
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[-1].strip() or (request.client.host if request.client else "unknown")
+    auth = request.url.path.startswith("/auth/")
+    if too_many(("a:" if auth else "i:") + ip, AUTH_LIMIT if auth else IP_LIMIT):
+        return JSONResponse({"detail": "Too many requests. Slow down."}, status_code=429, headers={"Retry-After": "60"})
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[DASHBOARD_ORIGIN],
@@ -94,13 +136,15 @@ async def health():
 
 
 @app.get("/auth/login")
-async def login():
+async def login(n: str = ""):
+    if not re.fullmatch(r"[A-Za-z0-9]{16,64}", n):
+        raise HTTPException(400, "Bad login request")
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
         "scope": "identify",
-        "state": make_token("login-state", 5),
+        "state": make_token("login-state", 5, {"n": n}),
     }
     return RedirectResponse("https://discord.com/oauth2/authorize?" + urlencode(params))
 
@@ -133,7 +177,8 @@ async def callback(code: str = "", state: str = ""):
         if not mine:
             return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#error=noaccess")
     pass_token = make_token(user_id, 60 * 24 * 7)
-    return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#token={pass_token}")
+    nonce = str(data.get("n", ""))
+    return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/#token={pass_token}&n={nonce}")
 
 
 @app.get("/me")
