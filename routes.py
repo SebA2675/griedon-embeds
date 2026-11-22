@@ -1,4 +1,5 @@
 import json
+import re
 import time
 
 import discord
@@ -47,18 +48,214 @@ class ScheduleIn(BaseModel):
     replace_previous: bool = False
 
 
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+BLOCK_TYPES = {"text", "section", "images", "divider", "box", "button_row", "dropdown"}
+BUTTON_STYLES = {"grey", "blue", "green", "red"}
+
+
+def bad(msg):
+    raise HTTPException(400, msg)
+
+
+def v_id(x, what):
+    if not isinstance(x, str) or not ID_RE.match(x):
+        bad("Invalid " + what + " id")
+
+
+def v_str(x, what, limit):
+    if not isinstance(x, str):
+        bad(what + " must be text")
+    if len(x) > limit:
+        bad(what + " is too long")
+
+
+def v_url(x, what):
+    v_str(x, what, 2000)
+    if x and not x.startswith("https://"):
+        bad(what + " must start with https://")
+
+
+def v_digits(x, what):
+    if x == "":
+        return
+    if not isinstance(x, str) or not x.isdigit() or len(x) > 25:
+        bad("Invalid " + what)
+
+
+def v_emoji(e):
+    if e is None:
+        return
+    if not isinstance(e, dict):
+        bad("Invalid emoji")
+    eid = str(e.get("id", ""))
+    name = str(e.get("name", ""))
+    if not eid.isdigit() or len(eid) > 25 or not re.match(r"^\w{1,32}$", name):
+        bad("Invalid emoji")
+
+
+def v_action(a):
+    if not isinstance(a, dict):
+        bad("Invalid action")
+    kind = a.get("type")
+    if kind == "link":
+        v_url(a.get("url", ""), "Link")
+    elif kind in ("reply", "form"):
+        ref = a.get("reply_id" if kind == "reply" else "form_id", "")
+        if ref != "":
+            v_id(ref, kind)
+    elif kind == "role":
+        v_digits(a.get("role_id", ""), "role")
+        if a.get("mode", "toggle") not in ("toggle", "add", "remove"):
+            bad("Invalid role mode")
+    else:
+        bad("Unknown action type")
+
+
+def v_button(b):
+    if not isinstance(b, dict):
+        bad("Invalid button")
+    v_id(b.get("id"), "button")
+    v_str(b.get("label", ""), "Button label", 80)
+    if b.get("style", "grey") not in BUTTON_STYLES:
+        bad("Invalid button colour")
+    v_emoji(b.get("emoji"))
+    v_action(b.get("action") or {"type": "link", "url": b.get("url", "")})
+
+
+def v_block(b, in_box=False):
+    if not isinstance(b, dict):
+        bad("Invalid part")
+    v_id(b.get("id"), "part")
+    kind = b.get("type")
+    if kind not in BLOCK_TYPES:
+        bad("Unknown part type")
+    if kind == "text":
+        v_str(b.get("content", ""), "Text", 8000)
+    elif kind == "section":
+        v_str(b.get("content", ""), "Text", 8000)
+        side = b.get("side", "button")
+        if side not in ("button", "thumbnail"):
+            bad("Invalid side option")
+        if side == "thumbnail":
+            v_url(b.get("image", ""), "Thumbnail link")
+        else:
+            v_button(b.get("button"))
+    elif kind == "images":
+        urls = b.get("urls", [])
+        if not isinstance(urls, list) or len(urls) > 20:
+            bad("Too many images in one part")
+        for u in urls:
+            v_url(u, "Image link")
+    elif kind == "divider":
+        if b.get("spacing", "small") not in ("small", "large"):
+            bad("Invalid divider spacing")
+    elif kind == "box":
+        if in_box:
+            bad("A box can't contain another box")
+        if not re.match(r"^#[0-9a-fA-F]{6}$", str(b.get("accent", "#5865F2"))):
+            bad("Invalid box colour")
+        kids = b.get("children", [])
+        if not isinstance(kids, list) or len(kids) > 40:
+            bad("Too many parts in a box")
+        for c in kids:
+            v_block(c, True)
+    elif kind == "button_row":
+        btns = b.get("buttons", [])
+        if not isinstance(btns, list) or len(btns) > 10:
+            bad("Too many buttons in a row")
+        for x in btns:
+            v_button(x)
+    elif kind == "dropdown":
+        v_str(b.get("placeholder", ""), "Placeholder", 150)
+        opts = b.get("options", [])
+        if not isinstance(opts, list) or len(opts) > 50:
+            bad("Too many dropdown options")
+        for o in opts:
+            if not isinstance(o, dict):
+                bad("Invalid option")
+            v_id(o.get("id"), "option")
+            v_str(o.get("label", ""), "Option label", 100)
+            v_str(o.get("description", ""), "Option description", 100)
+            v_emoji(o.get("emoji"))
+            v_action(o.get("action"))
+
+
+def v_embed(e):
+    if not isinstance(e, dict):
+        bad("Invalid embed")
+    v_id(e.get("id"), "embed")
+    for key, limit in (("title", 256), ("description", 4096), ("author_name", 256), ("footer_text", 2048)):
+        v_str(e.get(key, ""), "Embed " + key.replace("_", " "), limit)
+    for key in ("url", "author_url", "author_icon", "image", "thumbnail", "footer_icon"):
+        v_url(e.get(key, ""), "Embed link")
+    if not re.match(r"^#[0-9a-fA-F]{6}$", str(e.get("color", "#5865F2"))):
+        bad("Invalid embed colour")
+    fields = e.get("fields", [])
+    if not isinstance(fields, list) or len(fields) > 25:
+        bad("Too many embed fields")
+    for f in fields:
+        if not isinstance(f, dict):
+            bad("Invalid embed field")
+        v_id(f.get("id"), "field")
+        v_str(f.get("name", ""), "Field name", 256)
+        v_str(f.get("value", ""), "Field value", 1024)
+
+
+def v_blocks(blocks):
+    if not isinstance(blocks, list) or len(blocks) > 40:
+        bad("Too many parts")
+    for b in blocks:
+        v_block(b)
+
+
 def check_layout(layout):
-    blocks = layout.get("blocks")
-    if not isinstance(blocks, list):
-        raise HTTPException(400, "layout must contain a list called blocks")
+    if not isinstance(layout, dict):
+        bad("layout must be an object")
+    if len(json.dumps(layout)) > 200000:
+        bad("Message is too large")
+    v_digits(str(layout.get("guild_id") or ""), "server id")
+    kind = layout.get("kind", "layout")
+    if kind not in ("layout", "classic"):
+        bad("Unknown message kind")
+    if kind == "classic":
+        v_str(layout.get("content", ""), "Message text", 2000)
+        embeds = layout.get("embeds", [])
+        if not isinstance(embeds, list) or len(embeds) > 10:
+            bad("A message can have at most 10 embeds")
+        for e in embeds:
+            v_embed(e)
+    v_blocks(layout.get("blocks"))
     replies = layout.get("replies", [])
     if not isinstance(replies, list) or len(replies) > 25:
-        raise HTTPException(400, "replies must be a list of at most 25")
+        bad("replies must be a list of at most 25")
+    for r in replies:
+        if not isinstance(r, dict):
+            bad("Invalid reply")
+        v_id(r.get("id"), "reply")
+        v_str(r.get("name", ""), "Reply name", 100)
+        v_blocks(r.get("blocks", []))
     forms = layout.get("forms", [])
     if not isinstance(forms, list) or len(forms) > 25:
-        raise HTTPException(400, "forms must be a list of at most 25")
-    if len(json.dumps(layout)) > 200000:
-        raise HTTPException(400, "Message is too large")
+        bad("forms must be a list of at most 25")
+    for f in forms:
+        if not isinstance(f, dict):
+            bad("Invalid form")
+        v_id(f.get("id"), "form")
+        v_str(f.get("name", ""), "Form name", 100)
+        v_str(f.get("title", ""), "Form title", 100)
+        v_str(f.get("thanks", ""), "Thank-you text", 2000)
+        v_digits(f.get("channel_id", ""), "channel")
+        fields = f.get("fields", [])
+        if not isinstance(fields, list) or len(fields) > 10:
+            bad("Too many form questions")
+        for q in fields:
+            if not isinstance(q, dict):
+                bad("Invalid question")
+            v_id(q.get("id"), "question")
+            v_str(q.get("label", ""), "Question label", 100)
+            v_str(q.get("placeholder", ""), "Hint text", 200)
+            if q.get("style", "short") not in ("short", "paragraph"):
+                bad("Invalid question size")
 
 
 def clean_name(name):
