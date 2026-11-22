@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 import db
 import timeutil
-from routes import check_form_channels, find_channel, make_view
+from routes import SAFE_MENTIONS, check_form_channels, find_channel, make_view
 
 CHECK_SECONDS = 30
 MAX_LATE_SECONDS = 3600
@@ -54,7 +54,10 @@ async def run_schedule(client, s):
             if s["replace_previous"] and message["posted_message_id"]:
                 await delete_previous(client, message)
 
-            sent = await channel.send(**view)
+            sent = await channel.send(
+                **view,
+                allowed_mentions=SAFE_MENTIONS
+            )
 
             db.set_posted(
                 message["id"],
@@ -75,7 +78,10 @@ async def run_schedule(client, s):
                 int(message["posted_message_id"])
             )
 
-            await target.edit(**view)
+            await target.edit(
+                **view,
+                allowed_mentions=SAFE_MENTIONS
+            )
 
         db.add_version(
             message["id"],
