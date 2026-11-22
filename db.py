@@ -100,6 +100,22 @@ def init_db():
         conn.commit()
 
 
+def is_changed(message_id):
+    with closing(connect()) as conn:
+        msg = conn.execute(
+            "SELECT layout_json, posted_message_id FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        ver = conn.execute(
+            "SELECT layout_json FROM versions WHERE message_id = ? ORDER BY id DESC LIMIT 1", (message_id,)
+        ).fetchone()
+    if not msg or not msg["posted_message_id"] or not ver:
+        return False
+    try:
+        return json.loads(msg["layout_json"]) != json.loads(ver["layout_json"])
+    except ValueError:
+        return False
+
+
 def to_dict(row, full=True):
     data = {
         "id": row["id"],
@@ -108,6 +124,7 @@ def to_dict(row, full=True):
         "channel_id": row["channel_id"],
         "posted_message_id": row["posted_message_id"],
         "updated_at": row["updated_at"],
+        "changed": is_changed(row["id"]) if row["posted_message_id"] else False,
     }
     if full:
         data["layout"] = json.loads(row["layout_json"])
