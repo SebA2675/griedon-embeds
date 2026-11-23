@@ -112,6 +112,12 @@ def init_db():
             )
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_guild ON messages(guild_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_message ON schedules(message_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_templates_guild ON templates(guild_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_personas_guild ON webhook_personas(guild_id)")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "webhook_id" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN webhook_id TEXT")
