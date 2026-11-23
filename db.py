@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sqlite3
 import time
 from contextlib import closing
@@ -10,6 +11,14 @@ def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def text_hash(text):
+    try:
+        text = json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"))
+    except ValueError:
+        pass
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
 def init_db():
@@ -121,6 +130,19 @@ def init_db():
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "webhook_id" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN webhook_id TEXT")
+        for col in ("layout_hash", "version_hash"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
+        for row in conn.execute("SELECT id, layout_json FROM messages WHERE layout_hash IS NULL").fetchall():
+            conn.execute("UPDATE messages SET layout_hash = ? WHERE id = ?", (text_hash(row["layout_json"]), row["id"]))
+        latest = conn.execute(
+            "SELECT message_id, layout_json FROM versions WHERE id IN (SELECT MAX(id) FROM versions GROUP BY message_id)"
+        ).fetchall()
+        for row in latest:
+            conn.execute(
+                "UPDATE messages SET version_hash = ? WHERE id = ? AND version_hash IS NULL",
+                (text_hash(row["layout_json"]), row["message_id"]),
+            )
         rows = conn.execute("SELECT id, layout_json FROM messages WHERE guild_id IS NULL").fetchall()
         for row in rows:
             try:
@@ -132,20 +154,16 @@ def init_db():
         conn.commit()
 
 
+def row_changed(row):
+    if not row["posted_message_id"] or not row["layout_hash"] or not row["version_hash"]:
+        return False
+    return row["layout_hash"] != row["version_hash"]
+
+
 def is_changed(message_id):
     with closing(connect()) as conn:
-        msg = conn.execute(
-            "SELECT layout_json, posted_message_id FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-        ver = conn.execute(
-            "SELECT layout_json FROM versions WHERE message_id = ? ORDER BY id DESC LIMIT 1", (message_id,)
-        ).fetchone()
-    if not msg or not msg["posted_message_id"] or not ver:
-        return False
-    try:
-        return json.loads(msg["layout_json"]) != json.loads(ver["layout_json"])
-    except ValueError:
-        return False
+        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    return row_changed(row) if row else False
 
 
 def to_dict(row, full=True):
@@ -157,7 +175,7 @@ def to_dict(row, full=True):
         "posted_message_id": row["posted_message_id"],
         "webhook_id": row["webhook_id"],
         "updated_at": row["updated_at"],
-        "changed": is_changed(row["id"]) if row["posted_message_id"] else False,
+        "changed": row_changed(row),
     }
     if full:
         data["layout"] = json.loads(row["layout_json"])
@@ -199,10 +217,12 @@ def get_message(message_id):
 
 def create_message(name, layout, guild_id):
     now = int(time.time())
+    text = json.dumps(layout)
     with closing(connect()) as conn:
         cur = conn.execute(
-            "INSERT INTO messages (name, guild_id, layout_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (name, guild_id, json.dumps(layout), now, now),
+            "INSERT INTO messages (name, guild_id, layout_json, layout_hash, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (name, guild_id, text, text_hash(text), now, now),
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -210,12 +230,14 @@ def create_message(name, layout, guild_id):
 
 
 def update_message(message_id, name, layout, guild_id):
+    text = json.dumps(layout)
     with closing(connect()) as conn:
         cur = conn.execute(
             """
             UPDATE messages SET
                 name = ?,
                 layout_json = ?,
+                layout_hash = ?,
                 updated_at = ?,
                 posted_message_id = CASE WHEN guild_id = ? THEN posted_message_id ELSE NULL END,
                 channel_id = CASE WHEN guild_id = ? THEN channel_id ELSE NULL END,
@@ -223,7 +245,7 @@ def update_message(message_id, name, layout, guild_id):
                 guild_id = ?
             WHERE id = ?
             """,
-            (name, json.dumps(layout), int(time.time()), guild_id, guild_id, guild_id, guild_id, message_id),
+            (name, text, text_hash(text), int(time.time()), guild_id, guild_id, guild_id, guild_id, message_id),
         )
         conn.commit()
         changed = cur.rowcount
@@ -331,11 +353,14 @@ def add_version(message_id, name, layout, keep=20):
             "SELECT layout_json FROM versions WHERE message_id = ? ORDER BY id DESC LIMIT 1", (message_id,)
         ).fetchone()
         if last and last["layout_json"] == text:
+            conn.execute("UPDATE messages SET version_hash = ? WHERE id = ?", (text_hash(text), message_id))
+            conn.commit()
             return
         conn.execute(
             "INSERT INTO versions (message_id, name, layout_json, created_at) VALUES (?, ?, ?, ?)",
             (message_id, name, text, int(time.time())),
         )
+        conn.execute("UPDATE messages SET version_hash = ? WHERE id = ?", (text_hash(text), message_id))
         conn.execute(
             """
             DELETE FROM versions WHERE message_id = ? AND id NOT IN (
