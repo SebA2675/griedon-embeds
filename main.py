@@ -153,7 +153,8 @@ async def login(n: str = ""):
 async def callback(code: str = "", state: str = ""):
     data = read_token(state)
     if not code or not data or data.get("sub") != "login-state":
-        raise HTTPException(400, "Bad login request")
+        print("Login callback refused: missing code or expired state")
+        return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/")
     async with aiohttp.ClientSession() as session:
         form = {
             "client_id": CLIENT_ID,
@@ -164,7 +165,8 @@ async def callback(code: str = "", state: str = ""):
         }
         async with session.post("https://discord.com/api/oauth2/token", data=form) as resp:
             if resp.status != 200:
-                raise HTTPException(400, "Discord rejected the login")
+                print("Login callback refused: Discord rejected the code (probably already used)")
+                return RedirectResponse(f"{DASHBOARD_ORIGIN}/dashboard/")
             tokens = await resp.json()
         headers = {"Authorization": "Bearer " + tokens["access_token"]}
         async with session.get("https://discord.com/api/users/@me", headers=headers) as resp:
@@ -205,7 +207,7 @@ class EmbedBot(discord.Client):
 
     async def leave_unapproved(self, guild):
         db.add_pending(str(guild.id), guild.name)
-        print(f"Leaving unapproved server {guild.name} ({guild.id})")
+        print(f"Leaving unapproved server {guild.name} (first run).")
         try:
             await guild.leave()
         except discord.HTTPException as err:
