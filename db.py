@@ -816,3 +816,8 @@ def delete_access_request(req_id):
     with closing(connect()) as conn:
         conn.execute("DELETE FROM access_requests WHERE id = ?", (req_id,))
         conn.commit()
+def set_schedule_active(schedule_id, active):
+    with closing(connect()) as conn:
+        conn.execute("UPDATE schedules SET active = ? WHERE id = ?", (1 if active else 0, schedule_id))
+        conn.commit()
+    return get_schedule(schedule_id)

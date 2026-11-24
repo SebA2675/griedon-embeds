@@ -123,7 +123,8 @@ def finish(s, status):
             s["run_time"],
             s["tz"],
             s["repeat"],
-            now
+            now,
+            current_ts=s.get("next_run"),
         )
 
         db.finish_schedule(

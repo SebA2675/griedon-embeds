@@ -53,6 +53,20 @@ class SendIn(StrictModel):
     guild_id: str
     channel_id: str
     variables: dict[str, str] = Field(default_factory=dict)
+    thread_name: str = ""
+    silent: StrictBool = False
+    suppress_embeds: StrictBool = False
+    publish: StrictBool = False
+    ping_role_id: str = ""
+    extra_channel_ids: list[str] = Field(default_factory=list, max_length=10)
+
+
+class ScheduleToggleIn(StrictModel):
+    active: StrictBool
+
+
+class WebhookCreateIn(StrictModel):
+    name: str
 
 
 class UpdateIn(StrictModel):
@@ -621,18 +635,48 @@ def make_view(layout, message_id, page_index=0):
         raise HTTPException(400, str(err))
 
 
+def channel_missing_perms(channel):
+    perms = channel.permissions_for(channel.guild.me)
+    missing = []
+    if not perms.view_channel:
+        missing.append("View Channel")
+    if isinstance(channel, discord.Thread):
+        if not perms.send_messages_in_threads:
+            missing.append("Send Messages in Threads")
+    elif isinstance(channel, discord.ForumChannel):
+        if not perms.create_public_threads:
+            missing.append("Create Public Threads")
+        if not perms.send_messages_in_threads:
+            missing.append("Send Messages in Threads")
+    else:
+        if not perms.send_messages:
+            missing.append("Send Messages")
+    if not perms.embed_links:
+        missing.append("Embed Links")
+    return missing
+
+
 def find_channel(client, guild_id, channel_id):
     try:
         channel = client.get_channel(int(channel_id))
     except (TypeError, ValueError):
         raise HTTPException(400, "Bad channel id")
 
-    if not isinstance(channel, discord.TextChannel) or str(channel.guild.id) != str(guild_id):
+    allowed_types = (discord.TextChannel, discord.Thread, discord.ForumChannel)
+    if not isinstance(channel, allowed_types) or str(channel.guild.id) != str(guild_id):
         raise HTTPException(404, "Channel not found")
 
     perms = channel.permissions_for(channel.guild.me)
-    if not (perms.view_channel and perms.send_messages):
-        raise HTTPException(403, "The bot can't send messages in that channel")
+    if isinstance(channel, discord.Thread):
+        ok = perms.view_channel and perms.send_messages_in_threads
+    elif isinstance(channel, discord.ForumChannel):
+        ok = perms.view_channel and perms.create_public_threads and perms.send_messages_in_threads
+    else:
+        ok = perms.view_channel and perms.send_messages
+
+    if not ok:
+        missing = channel_missing_perms(channel)
+        raise HTTPException(403, "Missing permission(s) in #" + channel.name + ": " + ", ".join(missing))
 
     return channel
 
@@ -744,8 +788,81 @@ def make_router(require_user, get_client, owner_id):
             perms = ch.permissions_for(guild.me)
             if perms.view_channel and perms.send_messages:
                 category = ch.category.name if ch.category else None
-                result.append({"id": str(ch.id), "name": ch.name, "category": category})
+                kind = "news" if ch.is_news() else "text"
+                result.append({"id": str(ch.id), "name": ch.name, "category": category, "type": kind})
+        for fc in getattr(guild, "forums", []):
+            perms = fc.permissions_for(guild.me)
+            if perms.view_channel and perms.create_public_threads and perms.send_messages_in_threads:
+                category = fc.category.name if fc.category else None
+                result.append({"id": str(fc.id), "name": fc.name + " (Forum)", "category": category, "type": "forum"})
+        for th in guild.threads:
+            if th.archived:
+                continue
+            perms = th.permissions_for(guild.me)
+            if perms.view_channel and perms.send_messages_in_threads:
+                parent = th.parent.name if th.parent else "Thread"
+                result.append({"id": str(th.id), "name": th.name + " (Thread)", "category": parent, "type": "thread"})
         return result
+
+    @router.get("/guilds/{guild_id}/channels/{channel_id}/permissions")
+    async def channel_permissions(guild_id: str, channel_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        ch = get_client().get_channel(int(channel_id)) if channel_id.isdigit() else None
+        if ch is None or str(ch.guild.id) != str(guild.id):
+            raise HTTPException(404, "Channel not found")
+        perms = ch.permissions_for(guild.me)
+        missing = channel_missing_perms(ch)
+        return {
+            "ok": len(missing) == 0,
+            "missing": missing,
+            "can_webhook": bool(perms.manage_webhooks),
+            "is_news": bool(isinstance(ch, discord.TextChannel) and ch.is_news()),
+            "is_forum": isinstance(ch, discord.ForumChannel),
+        }
+
+    @router.get("/guilds/{guild_id}/channels/{channel_id}/webhooks")
+    async def list_channel_webhooks(guild_id: str, channel_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        ch = find_channel(get_client(), guild_id, channel_id)
+        if isinstance(ch, discord.Thread) and ch.parent:
+            ch = ch.parent
+        hooks = await webhooks.hooks_in(ch)
+        return [{"id": str(h.id), "name": h.name, "is_mine": webhooks.is_mine(h, get_client())} for h in hooks]
+
+    @router.post("/guilds/{guild_id}/channels/{channel_id}/webhooks")
+    async def create_channel_webhook(guild_id: str, channel_id: str, body: WebhookCreateIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        ch = find_channel(get_client(), guild_id, channel_id)
+        if isinstance(ch, discord.Thread) and ch.parent:
+            ch = ch.parent
+        name = body.name.strip()[:80]
+        if not name:
+            bad("Webhook name is required")
+        try:
+            h = await ch.create_webhook(name=name, reason="Created from dashboard")
+        except discord.Forbidden:
+            raise webhooks.need_permission(ch)
+        return {"id": str(h.id), "name": h.name, "is_mine": True}
+
+    @router.delete("/guilds/{guild_id}/channels/{channel_id}/webhooks/{hook_id}")
+    async def delete_channel_webhook(guild_id: str, channel_id: str, hook_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        ch = find_channel(get_client(), guild_id, channel_id)
+        if isinstance(ch, discord.Thread) and ch.parent:
+            ch = ch.parent
+        hooks = await webhooks.hooks_in(ch)
+        target = next((h for h in hooks if str(h.id) == str(hook_id)), None)
+        if not target:
+            raise HTTPException(404, "Webhook not found")
+        try:
+            await target.delete(reason="Deleted from dashboard")
+        except discord.Forbidden:
+            raise webhooks.need_permission(ch)
+        return {"deleted": True}
 
     @router.get("/guilds/{guild_id}/roles")
     async def roles(guild_id: str, authorization: str = Header(default=None)):
@@ -814,14 +931,48 @@ def make_router(require_user, get_client, owner_id):
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], body.channel_id)
-        view = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel, overrides=body.variables), message_id)
+        mentions = SAFE_MENTIONS
+        if body.ping_role_id and body.ping_role_id.isdigit():
+            mentions = discord.AllowedMentions(
+                everyone=False,
+                roles=[discord.Object(int(body.ping_role_id))],
+                users=True,
+                replied_user=False,
+            )
+
+        async def _send_to(target_ch):
+            v = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=target_ch, overrides=body.variables), message_id)
+            if body.ping_role_id and body.ping_role_id.isdigit() and found["layout"].get("kind") == "classic":
+                v["content"] = f"<@&{body.ping_role_id}> " + (v.get("content") or "")
+            kwargs = dict(v)
+            if body.silent:
+                kwargs["silent"] = True
+            if body.suppress_embeds:
+                kwargs["suppress_embeds"] = True
+            if isinstance(target_ch, discord.ForumChannel):
+                tname = body.thread_name.strip()[:100]
+                if not tname:
+                    raise HTTPException(400, "A thread title is required when posting to a Forum channel")
+                twm = await target_ch.create_thread(name=tname, allowed_mentions=mentions, **kwargs)
+                return twm.thread, twm.message
+            msg = await target_ch.send(**kwargs, allowed_mentions=mentions)
+            if body.publish and isinstance(target_ch, discord.TextChannel) and target_ch.is_news():
+                try:
+                    await msg.publish()
+                except discord.HTTPException:
+                    pass
+            return target_ch, msg
 
         try:
-            sent = await channel.send(**view, allowed_mentions=SAFE_MENTIONS)
+            dest_ch, sent = await _send_to(channel)
+            for extra_cid in body.extra_channel_ids:
+                if extra_cid and str(extra_cid) != str(body.channel_id):
+                    ech = find_channel(get_client(), found["guild_id"], extra_cid)
+                    await _send_to(ech)
         except discord.HTTPException as err:
             raise discord_error(err)
 
-        db.set_posted(message_id, found["guild_id"], str(channel.id), str(sent.id))
+        db.set_posted(message_id, found["guild_id"], str(dest_ch.id), str(sent.id))
         db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
 
@@ -995,7 +1146,7 @@ def make_router(require_user, get_client, owner_id):
         if body.action not in ("post", "update"):
             raise HTTPException(400, "Unknown action")
 
-        if body.repeat not in ("once", "daily", "weekly"):
+        if body.repeat not in timeutil.VALID_REPEATS:
             raise HTTPException(400, "Unknown repeat option")
 
         channel_id = ""
@@ -1032,6 +1183,15 @@ def make_router(require_user, get_client, owner_id):
             body.replace_previous and body.action == "post",
             next_run
         )
+
+    @router.post("/schedules/{schedule_id}/toggle")
+    async def toggle_schedule(schedule_id: int, body: ScheduleToggleIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = db.get_schedule(schedule_id)
+        if not found:
+            raise HTTPException(404, "Schedule not found")
+        await user_guild(uid, found["guild_id"])
+        return db.set_schedule_active(schedule_id, body.active)
 
     @router.delete("/schedules/{schedule_id}")
     async def remove_schedule(schedule_id: int, authorization: str = Header(default=None)):
