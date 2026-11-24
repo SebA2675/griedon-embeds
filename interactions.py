@@ -5,6 +5,7 @@ import discord
 import builder
 import db
 import forms
+import variables
 
 
 def walk_blocks(blocks):
@@ -126,7 +127,8 @@ async def handle_role(interaction, action):
 async def run_action(interaction, message, action, on_done=None):
     kind = action.get("type")
     if kind == "reply":
-        view = builder.build_reply_view(message["layout"], message["id"], action.get("reply_id"))
+        resolved = variables.resolve_layout(message["layout"], guild=interaction.guild, channel=interaction.channel, user=interaction.user)
+        view = builder.build_reply_view(resolved, message["id"], action.get("reply_id"))
         await interaction.response.send_message(view=view, ephemeral=True)
     elif kind == "role":
         await handle_role(interaction, action)

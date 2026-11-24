@@ -758,7 +758,7 @@ def make_router(require_user, get_client, owner_id):
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], body.channel_id)
-        view = make_view(found["layout"], message_id)
+        view = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel), message_id)
 
         try:
             sent = await channel.send(**view, allowed_mentions=SAFE_MENTIONS)
@@ -778,7 +778,7 @@ def make_router(require_user, get_client, owner_id):
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
-        view = make_view(found["layout"], message_id)
+        view = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel), message_id)
         try:
             if found["webhook_id"]:
                 await webhooks.edit(
@@ -860,7 +860,7 @@ def make_router(require_user, get_client, owner_id):
             raise HTTPException(404, "Preset not found")
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], body.channel_id)
-        payload = make_view(found["layout"], message_id)
+        payload = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel), message_id)
         try:
             hook, sent = await webhooks.send(get_client(), channel, payload, persona, SAFE_MENTIONS)
         except discord.HTTPException as err:
@@ -881,12 +881,13 @@ def make_router(require_user, get_client, owner_id):
         check_form_channels(found["layout"], guild)
 
         try:
-            payload = builder.build_payload(found["layout"], message_id)
+            user = await get_client().fetch_user(int(uid))
+            resolved = variables.resolve_layout(found["layout"], guild=guild, user=user)
+            payload = builder.build_payload(resolved, message_id)
         except ValueError as err:
             raise HTTPException(400, str(err))
 
         try:
-            user = await get_client().fetch_user(int(uid))
             await user.send(**payload, allowed_mentions=SAFE_MENTIONS)
         except discord.Forbidden:
             raise HTTPException(
