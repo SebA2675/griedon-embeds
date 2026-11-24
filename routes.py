@@ -20,6 +20,7 @@ import access
 import builder
 import db
 import timeutil
+import variables
 import webhooks
 
 MAX_PER_GUILD = 200
@@ -84,6 +85,7 @@ class HookSendIn(StrictModel):
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 EMOJI_NAME_RE = re.compile(r"^\w{1,32}$")
+VAR_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -464,6 +466,24 @@ def check_v2_limits(blocks, label: str):
         raise ValueError(f"{label} cannot have more than 4000 text characters")
 
 
+class VariableModel(StrictModel):
+    id: str
+    name: str
+    default: str = ""
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "variable")
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, v):
+        if not isinstance(v, str) or not VAR_NAME_RE.fullmatch(v):
+            raise ValueError("Variable name must be 1-32 chars, letters/numbers/underscore only")
+        return v
+
+
 class LayoutModel(StrictModel):
     kind: Literal["layout", "classic"] = "layout"
     guild_id: Optional[str] = ""
@@ -472,6 +492,7 @@ class LayoutModel(StrictModel):
     embeds: list[EmbedModel] = Field(default_factory=list, max_length=10)
     replies: list[ReplyModel] = Field(default_factory=list, max_length=25)
     forms: list[FormModel] = Field(default_factory=list, max_length=25)
+    variables: list[VariableModel] = Field(default_factory=list, max_length=20)
 
     @field_validator("guild_id")
     @classmethod
@@ -1169,5 +1190,24 @@ def make_router(require_user, get_client, owner_id):
             raise HTTPException(400, "Bad server id")
         db.remove_pending(guild_id)
         return {"ok": True}
+
+    # ----- Variable preview -----
+
+    @router.post("/messages/{message_id}/preview-variables")
+    async def preview_variables(message_id: int, body: dict, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        vals = body.get("values", {})
+        if not isinstance(vals, dict):
+            bad("values must be an object")
+        # Sanitise: only string values, known variable names
+        layout = found["layout"]
+        allowed = {v.get("name") for v in layout.get("variables", []) if isinstance(v, dict) and v.get("name")}
+        clean = {}
+        for k, v in vals.items():
+            if isinstance(k, str) and k in allowed and isinstance(v, str) and len(v) <= 2000:
+                clean[k] = v
+        substituted = variables.substitute(layout, clean)
+        return {"layout": substituted}
 
     return router
