@@ -122,6 +122,14 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS token_state (
+                user_id TEXT PRIMARY KEY,
+                valid_after INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_guild ON messages(guild_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
@@ -670,3 +678,31 @@ def stats():
     except OSError:
         size = 0
     return {"size_bytes": size, "counts": counts}
+
+
+# ---------- Logout (token revocation) ----------
+
+_valid_after = {}
+
+
+def get_valid_after(user_id):
+    """Tokens issued before this time (unix seconds) are no longer accepted."""
+    user_id = str(user_id)
+    if user_id not in _valid_after:
+        with closing(connect()) as conn:
+            row = conn.execute("SELECT valid_after FROM token_state WHERE user_id = ?", (user_id,)).fetchone()
+        _valid_after[user_id] = row["valid_after"] if row else 0
+    return _valid_after[user_id]
+
+
+def revoke_tokens(user_id):
+    user_id = str(user_id)
+    now = int(time.time())
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT INTO token_state (user_id, valid_after) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET valid_after = excluded.valid_after",
+            (user_id, now),
+        )
+        conn.commit()
+    _valid_after[user_id] = now

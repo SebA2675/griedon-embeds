@@ -60,7 +60,8 @@ if missing:
 
 
 def make_token(subject, minutes, extra=None):
-    payload = {"sub": subject, "exp": int(time.time()) + minutes * 60}
+    now = int(time.time())
+    payload = {"sub": subject, "iat": now, "exp": now + minutes * 60}
     payload.update(extra or {})
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
@@ -79,6 +80,8 @@ def require_user(authorization):
     sub = str((data or {}).get("sub", ""))
     if not sub.isdigit():
         raise HTTPException(401, "Invalid login")
+    if int(data.get("iat") or 0) < db.get_valid_after(sub):
+        raise HTTPException(401, "Logged out")
     if too_many("u:" + sub, 300):
         raise HTTPException(429, "Too many requests. Slow down.")
     return sub
@@ -191,6 +194,13 @@ async def me(authorization: str = Header(default=None)):
         if not mine:
             raise HTTPException(403, "You need to be an Administrator of a server where this bot is installed.")
     return {"user_id": uid, "is_owner": uid == OWNER_ID}
+
+
+@app.post("/logout")
+async def logout(authorization: str = Header(default=None)):
+    uid = require_user(authorization)
+    db.revoke_tokens(uid)
+    return {"logged_out": True}
 
 
 app.include_router(make_router(require_user, lambda: client, OWNER_ID))
