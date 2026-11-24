@@ -7,6 +7,8 @@ import db
 import forms
 import variables
 
+_page_state: dict[int, int] = {}
+
 
 def walk_blocks(blocks):
     for b in blocks:
@@ -138,6 +140,29 @@ async def run_action(interaction, message, action, on_done=None):
             await say(interaction, "This form was removed from the message.")
             return
         await interaction.response.send_modal(forms.FormModal(form, on_done))
+    elif kind == "page":
+        pages = message["layout"].get("pages") or []
+        if not pages:
+            await say(interaction, "This message has no pages.")
+            return
+        msg_id = interaction.message.id if interaction.message else 0
+        cur_idx = _page_state.get(msg_id, 0)
+        req = int(action.get("page_index", 0))
+        if req == -2:
+            target = (cur_idx + 1) % len(pages)
+        elif req == -1:
+            target = (cur_idx - 1) % len(pages)
+        else:
+            target = max(0, min(req, len(pages) - 1))
+        _page_state[msg_id] = target
+        resolved = variables.resolve_layout(
+            message["layout"],
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+        )
+        payload = builder.build_payload(resolved, message["id"], page_index=target)
+        await interaction.response.edit_message(**payload)
     else:
         await say(interaction, "This has no action.")
 

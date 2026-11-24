@@ -37,6 +37,7 @@ SAFE_MENTIONS = discord.AllowedMentions(
     replied_user=False
 )
 MAX_PERSONAS = 25
+MAX_SEQUENCES = 50
 
 
 class StrictModel(BaseModel):
@@ -50,6 +51,20 @@ class MessageIn(StrictModel):
 
 class SendIn(StrictModel):
     guild_id: str
+    channel_id: str
+    variables: dict[str, str] = Field(default_factory=dict)
+
+
+class UpdateIn(StrictModel):
+    variables: dict[str, str] = Field(default_factory=dict)
+
+
+class SequenceIn(StrictModel):
+    name: str
+    message_ids: list[StrictInt] = Field(min_length=1, max_length=10)
+
+
+class SequencePostIn(StrictModel):
     channel_id: str
 
 
@@ -81,6 +96,7 @@ class HookSendIn(StrictModel):
     guild_id: str
     channel_id: str
     persona_id: int
+    variables: dict[str, str] = Field(default_factory=dict)
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -174,8 +190,13 @@ class RoleAction(StrictModel):
         return check_digits(v, "role")
 
 
-ActionModel = Annotated[Union[LinkAction, ReplyAction, FormAction, RoleAction], Field(discriminator="type")]
-OptionActionModel = Annotated[Union[ReplyAction, FormAction, RoleAction], Field(discriminator="type")]
+class PageAction(StrictModel):
+    type: Literal["page"]
+    page_index: StrictInt = Field(default=0, ge=-2, le=24)
+
+
+ActionModel = Annotated[Union[LinkAction, ReplyAction, FormAction, RoleAction, PageAction], Field(discriminator="type")]
+OptionActionModel = Annotated[Union[ReplyAction, FormAction, RoleAction, PageAction], Field(discriminator="type")]
 
 
 class RuleMixin(StrictModel):
@@ -466,6 +487,19 @@ def check_v2_limits(blocks, label: str):
         raise ValueError(f"{label} cannot have more than 4000 text characters")
 
 
+class PageModel(StrictModel):
+    id: str
+    name: str = Field(default="", max_length=100)
+    blocks: list[TopBlock] = Field(default_factory=list, max_length=40)
+    content: str = Field(default="", max_length=2000)
+    embeds: list[EmbedModel] = Field(default_factory=list, max_length=10)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "page")
+
+
 class VariableModel(StrictModel):
     id: str
     name: str
@@ -493,6 +527,7 @@ class LayoutModel(StrictModel):
     replies: list[ReplyModel] = Field(default_factory=list, max_length=25)
     forms: list[FormModel] = Field(default_factory=list, max_length=25)
     variables: list[VariableModel] = Field(default_factory=list, max_length=20)
+    pages: list[PageModel] = Field(default_factory=list, max_length=25)
 
     @field_validator("guild_id")
     @classmethod
@@ -521,6 +556,9 @@ class LayoutModel(StrictModel):
             check_v2_limits(self.blocks, "Main message")
         for r in self.replies:
             check_v2_limits(r.blocks, f'Reply "{r.name or r.id}"')
+        for pg in self.pages:
+            if self.kind != "classic":
+                check_v2_limits(pg.blocks, f'Page "{pg.name or pg.id}"')
         return self
 
 
@@ -570,9 +608,9 @@ def strip_guild_refs(x):
             strip_guild_refs(value)
 
 
-def make_view(layout, message_id):
+def make_view(layout, message_id, page_index=0):
     try:
-        return builder.build_payload(layout, message_id)
+        return builder.build_payload(layout, message_id, page_index=page_index)
     except ValueError as err:
         raise HTTPException(400, str(err))
 
@@ -758,7 +796,7 @@ def make_router(require_user, get_client, owner_id):
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], body.channel_id)
-        view = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel), message_id)
+        view = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel, overrides=body.variables), message_id)
 
         try:
             sent = await channel.send(**view, allowed_mentions=SAFE_MENTIONS)
@@ -770,7 +808,7 @@ def make_router(require_user, get_client, owner_id):
         return db.get_message(message_id)
 
     @router.post("/messages/{message_id}/update")
-    async def update_posted(message_id: int, authorization: str = Header(default=None)):
+    async def update_posted(message_id: int, body: Optional[UpdateIn] = None, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await load_message(message_id, uid)
         if not found["posted_message_id"]:
@@ -778,7 +816,8 @@ def make_router(require_user, get_client, owner_id):
         guild = await user_guild(uid, found["guild_id"])
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], found["channel_id"])
-        view = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel), message_id)
+        overrides = body.variables if body else None
+        view = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel, overrides=overrides), message_id)
         try:
             if found["webhook_id"]:
                 await webhooks.edit(
@@ -860,7 +899,7 @@ def make_router(require_user, get_client, owner_id):
             raise HTTPException(404, "Preset not found")
         check_form_channels(found["layout"], guild)
         channel = find_channel(get_client(), found["guild_id"], body.channel_id)
-        payload = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel), message_id)
+        payload = make_view(variables.resolve_layout(found["layout"], guild=guild, channel=channel, overrides=body.variables), message_id)
         try:
             hook, sent = await webhooks.send(get_client(), channel, payload, persona, SAFE_MENTIONS)
         except discord.HTTPException as err:
@@ -1210,5 +1249,65 @@ def make_router(require_user, get_client, owner_id):
                 clean[k] = v
         substituted = variables.substitute(layout, clean)
         return {"layout": substituted}
+
+    # ----- Sequences -----
+
+    @router.get("/guilds/{guild_id}/sequences")
+    async def list_sequences(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        return db.list_sequences(str(guild.id))
+
+    @router.post("/guilds/{guild_id}/sequences")
+    async def create_sequence(guild_id: str, body: SequenceIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        gid = str(guild.id)
+        name = body.name.strip()[:100]
+        if not name:
+            bad("Sequence name is required")
+        if db.count_sequences(gid) >= MAX_SEQUENCES:
+            raise HTTPException(400, "This server has reached the sequence limit")
+        for mid in body.message_ids:
+            m = db.get_message(mid)
+            if not m or str(m.get("guild_id")) != gid:
+                raise HTTPException(400, f"Message {mid} does not belong to this server")
+        return db.create_sequence(gid, name, body.message_ids)
+
+    @router.delete("/sequences/{seq_id}")
+    async def remove_sequence(seq_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        seq = db.get_sequence(seq_id)
+        if not seq:
+            raise HTTPException(404, "Sequence not found")
+        await user_guild(uid, seq["guild_id"])
+        db.delete_sequence(seq_id)
+        return {"deleted": True}
+
+    @router.post("/sequences/{seq_id}/post-all")
+    async def post_sequence(seq_id: int, body: SequencePostIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        seq = db.get_sequence(seq_id)
+        if not seq:
+            raise HTTPException(404, "Sequence not found")
+        gid = seq["guild_id"]
+        guild = await user_guild(uid, gid)
+        channel = find_channel(get_client(), gid, body.channel_id)
+        posted = 0
+        for mid in seq["message_ids"]:
+            m = db.get_message(mid)
+            if not m or str(m.get("guild_id")) != gid:
+                continue
+            check_form_channels(m["layout"], guild)
+            resolved = variables.resolve_layout(m["layout"], guild=guild, channel=channel)
+            view = make_view(resolved, mid)
+            try:
+                sent = await channel.send(**view, allowed_mentions=SAFE_MENTIONS)
+            except discord.HTTPException as err:
+                raise discord_error(err)
+            db.set_posted(mid, gid, str(channel.id), str(sent.id))
+            db.add_version(mid, m["name"], m["layout"])
+            posted += 1
+        return {"posted": posted}
 
     return router

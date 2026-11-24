@@ -130,7 +130,20 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sequences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                message_ids_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_guild ON messages(guild_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sequences_guild ON sequences(guild_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_message ON schedules(message_id)")
@@ -706,3 +719,53 @@ def revoke_tokens(user_id):
         )
         conn.commit()
     _valid_after[user_id] = now
+
+def _seq_row(row):
+    d = dict(row)
+    d["message_ids"] = json.loads(d.pop("message_ids_json", "[]"))
+    return d
+
+
+def list_sequences(guild_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM sequences WHERE guild_id = ? ORDER BY updated_at DESC",
+            (str(guild_id),),
+        ).fetchall()
+    return [_seq_row(r) for r in rows]
+
+
+def count_sequences(guild_id):
+    with closing(connect()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM sequences WHERE guild_id = ?",
+            (str(guild_id),),
+        ).fetchone()
+    return int(row["n"])
+
+
+def get_sequence(seq_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM sequences WHERE id = ?", (seq_id,)).fetchone()
+    return _seq_row(row) if row else None
+
+
+def create_sequence(guild_id, name, message_ids):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO sequences (guild_id, name, message_ids_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(guild_id), name, json.dumps([int(x) for x in message_ids]), now, now),
+        )
+        conn.commit()
+        sid = cur.lastrowid
+    return get_sequence(sid)
+
+
+def delete_sequence(seq_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM sequences WHERE id = ?", (seq_id,))
+        conn.commit()

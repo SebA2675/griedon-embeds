@@ -45,6 +45,10 @@ def check_action(action, ctx):
             raise ValueError("A role action has no role chosen")
         if action.get("mode", "toggle") not in ("toggle", "add", "remove"):
             raise ValueError("A role action has a bad mode")
+    elif kind == "page":
+        idx = action.get("page_index", 0)
+        if not isinstance(idx, int) or idx < -2 or idx >= ctx.get("page_count", 0):
+            raise ValueError("Something points to a page that doesn't exist")
     else:
         raise ValueError("Unknown action")
 
@@ -195,6 +199,7 @@ def make_ctx(layout, message_id):
         "message_id": message_id,
         "reply_ids": {r.get("id") for r in layout.get("replies", [])},
         "form_ids": {f.get("id") for f in layout.get("forms", [])},
+        "page_count": len(layout.get("pages") or []),
     }
 
 
@@ -325,12 +330,22 @@ def build_classic(layout, ctx):
     return {"content": content or None, "embeds": embeds, "view": view}
 
 
-def build_payload(layout, message_id):
+def build_payload(layout, message_id, page_index=None):
     ctx = make_ctx(layout, message_id)
     for form in layout.get("forms", []):
         check_form(form)
     for reply in layout.get("replies", []):
         view_from_blocks(reply.get("blocks", []), ctx)
-    if layout.get("kind") == "classic":
-        return build_classic(layout, ctx)
-    return {"view": view_from_blocks(layout.get("blocks", []), ctx)}
+    pages = layout.get("pages") or []
+    effective = layout
+    if page_index is not None and pages and 0 <= page_index < len(pages):
+        p = pages[page_index]
+        effective = dict(layout)
+        if layout.get("kind") == "classic":
+            effective["content"] = p.get("content", "")
+            effective["embeds"] = p.get("embeds", [])
+        else:
+            effective["blocks"] = p.get("blocks", [])
+    if effective.get("kind") == "classic":
+        return build_classic(effective, ctx)
+    return {"view": view_from_blocks(effective.get("blocks", []), ctx)}
