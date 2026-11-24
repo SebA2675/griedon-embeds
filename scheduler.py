@@ -5,6 +5,7 @@ import time
 import discord
 from fastapi import HTTPException
 
+import backup
 import db
 import timeutil
 import webhooks
@@ -164,5 +165,11 @@ async def run_loop(client):
 
         except Exception as err:
             print("Scheduler error:", err)
+
+        try:
+            await backup.maybe_backup()
+
+        except Exception as err:
+            print("Backup error:", type(err).__name__)
 
         await asyncio.sleep(CHECK_SECONDS)
