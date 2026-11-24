@@ -1,11 +1,20 @@
-
 import json
 import re
 import time
+from typing import Annotated, Literal, Optional, Union
 
 import discord
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 import access
 import builder
@@ -29,26 +38,30 @@ SAFE_MENTIONS = discord.AllowedMentions(
 MAX_PERSONAS = 25
 
 
-class MessageIn(BaseModel):
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class MessageIn(StrictModel):
     name: str
     layout: dict
 
 
-class SendIn(BaseModel):
+class SendIn(StrictModel):
     guild_id: str
     channel_id: str
 
 
-class AllowIn(BaseModel):
+class AllowIn(StrictModel):
     guild_id: str
     name: str = ""
 
 
-class ImportIn(BaseModel):
+class ImportIn(StrictModel):
     data: dict
 
 
-class ScheduleIn(BaseModel):
+class ScheduleIn(StrictModel):
     action: str
     channel_id: str = ""
     run_date: str
@@ -58,207 +71,447 @@ class ScheduleIn(BaseModel):
     replace_previous: bool = False
 
 
-class PersonaIn(BaseModel):
+class PersonaIn(StrictModel):
     name: str
     avatar_url: str = ""
 
 
-class HookSendIn(BaseModel):
+class HookSendIn(StrictModel):
     guild_id: str
     channel_id: str
     persona_id: int
 
 
-ID_RE = re.compile(r"^[A-Za-z0-9\_-]{1,40}$")
-BLOCK_TYPES = {"text", "section", "images", "divider", "box", "button_row", "dropdown"}
-BUTTON_STYLES = {"grey", "blue", "green", "red"}
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+EMOJI_NAME_RE = re.compile(r"^\w{1,32}$")
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def check_id(v: str, what: str = "id") -> str:
+    if not isinstance(v, str) or not ID_RE.fullmatch(v):
+        raise ValueError(f"Invalid {what} id")
+    return v
+
+
+def check_https(v: str, what: str = "Link") -> str:
+    if not isinstance(v, str):
+        raise ValueError(f"{what} must be text")
+    if len(v) > 2000:
+        raise ValueError(f"{what} is too long")
+    if v and not v.startswith("https://"):
+        raise ValueError(f"{what} must start with https://")
+    return v
+
+
+def check_digits(v: Optional[str], what: str = "id") -> str:
+    if v is None or v == "":
+        return ""
+    if not isinstance(v, str) or not v.isdigit() or len(v) > 25:
+        raise ValueError(f"Invalid {what}")
+    return v
+
+
+class EmojiModel(StrictModel):
+    id: str
+    name: str
+    animated: StrictBool = False
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        if not isinstance(v, str) or not v.isdigit() or len(v) > 25:
+            raise ValueError("Invalid emoji")
+        return v
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, v):
+        if not isinstance(v, str) or not EMOJI_NAME_RE.fullmatch(v):
+            raise ValueError("Invalid emoji")
+        return v
+
+
+class LinkAction(StrictModel):
+    type: Literal["link"]
+    url: str = ""
+
+    @field_validator("url")
+    @classmethod
+    def valid_url(cls, v):
+        return check_https(v, "Link")
+
+
+class ReplyAction(StrictModel):
+    type: Literal["reply"]
+    reply_id: str = ""
+
+    @field_validator("reply_id")
+    @classmethod
+    def valid_ref(cls, v):
+        return "" if v == "" else check_id(v, "reply")
+
+
+class FormAction(StrictModel):
+    type: Literal["form"]
+    form_id: str = ""
+
+    @field_validator("form_id")
+    @classmethod
+    def valid_ref(cls, v):
+        return "" if v == "" else check_id(v, "form")
+
+
+class RoleAction(StrictModel):
+    type: Literal["role"]
+    role_id: str = ""
+    mode: Literal["toggle", "add", "remove"] = "toggle"
+
+    @field_validator("role_id")
+    @classmethod
+    def valid_role(cls, v):
+        return check_digits(v, "role")
+
+
+ActionModel = Annotated[Union[LinkAction, ReplyAction, FormAction, RoleAction], Field(discriminator="type")]
+OptionActionModel = Annotated[Union[ReplyAction, FormAction, RoleAction], Field(discriminator="type")]
+
+
+class RuleMixin(StrictModel):
+    allowed_roles: list[str] = Field(default_factory=list, max_length=10)
+    cooldown: StrictInt = Field(default=0, ge=0, le=86400)
+    once: StrictBool = False
+
+    @field_validator("allowed_roles")
+    @classmethod
+    def valid_roles(cls, v):
+        for r in v:
+            if not isinstance(r, str) or not r.isdigit() or len(r) > 25:
+                raise ValueError("Invalid role")
+        return v
+
+
+class ButtonModel(RuleMixin):
+    id: str
+    label: str = Field(default="", max_length=80)
+    style: Literal["grey", "blue", "green", "red"] = "grey"
+    emoji: Optional[EmojiModel] = None
+    action: ActionModel
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_link(cls, data):
+        if isinstance(data, dict) and "action" not in data and "url" in data:
+            copy = dict(data)
+            copy["action"] = {"type": "link", "url": copy.pop("url") or ""}
+            return copy
+        return data
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "button")
+
+
+class DropdownOptionModel(RuleMixin):
+    id: str
+    label: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=100)
+    emoji: Optional[EmojiModel] = None
+    action: OptionActionModel
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "option")
+
+
+class TextBlock(StrictModel):
+    id: str
+    type: Literal["text"]
+    content: str = Field(default="", max_length=4000)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "part")
+
+
+class SectionBlock(StrictModel):
+    id: str
+    type: Literal["section"]
+    content: str = Field(default="", max_length=4000)
+    side: Literal["button", "thumbnail"] = "button"
+    button: Optional[ButtonModel] = None
+    image: str = ""
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "part")
+
+    @field_validator("image")
+    @classmethod
+    def valid_image(cls, v):
+        return check_https(v, "Thumbnail link")
+
+    @model_validator(mode="after")
+    def check_side(self):
+        if self.side == "button" and self.button is None:
+            raise ValueError("Section button is missing")
+        return self
+
+
+class ImagesBlock(StrictModel):
+    id: str
+    type: Literal["images"]
+    urls: list[str] = Field(default_factory=list, max_length=10)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "part")
+
+    @field_validator("urls")
+    @classmethod
+    def valid_urls(cls, v):
+        return [check_https(u, "Image link") for u in v]
+
+
+class DividerBlock(StrictModel):
+    id: str
+    type: Literal["divider"]
+    spacing: Literal["small", "large"] = "small"
+    line: StrictBool = True
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "part")
+
+
+class ButtonRowBlock(StrictModel):
+    id: str
+    type: Literal["button_row"]
+    buttons: list[ButtonModel] = Field(default_factory=list, max_length=5)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "part")
+
+
+class DropdownBlock(StrictModel):
+    id: str
+    type: Literal["dropdown"]
+    placeholder: str = Field(default="", max_length=150)
+    options: list[DropdownOptionModel] = Field(default_factory=list, max_length=25)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "part")
+
+
+ChildBlock = Annotated[
+    Union[TextBlock, SectionBlock, ImagesBlock, DividerBlock, ButtonRowBlock, DropdownBlock],
+    Field(discriminator="type"),
+]
+
+
+class BoxBlock(StrictModel):
+    id: str
+    type: Literal["box"]
+    accent: str = "#5865F2"
+    children: list[ChildBlock] = Field(default_factory=list, max_length=40)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "part")
+
+    @field_validator("accent")
+    @classmethod
+    def valid_accent(cls, v):
+        if not isinstance(v, str) or not HEX_RE.fullmatch(v):
+            raise ValueError("Invalid box colour")
+        return v
+
+
+TopBlock = Annotated[
+    Union[TextBlock, SectionBlock, ImagesBlock, DividerBlock, ButtonRowBlock, DropdownBlock, BoxBlock],
+    Field(discriminator="type"),
+]
+
+
+class EmbedFieldModel(StrictModel):
+    id: str
+    name: str = Field(default="", max_length=256)
+    value: str = Field(default="", max_length=1024)
+    inline: StrictBool = False
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "field")
+
+
+class EmbedModel(StrictModel):
+    id: str
+    title: str = Field(default="", max_length=256)
+    description: str = Field(default="", max_length=4096)
+    color: str = "#5865F2"
+    url: str = ""
+    author_name: str = Field(default="", max_length=256)
+    author_url: str = ""
+    author_icon: str = ""
+    image: str = ""
+    thumbnail: str = ""
+    footer_text: str = Field(default="", max_length=2048)
+    footer_icon: str = ""
+    timestamp: StrictBool = False
+    fields: list[EmbedFieldModel] = Field(default_factory=list, max_length=25)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "embed")
+
+    @field_validator("color")
+    @classmethod
+    def valid_color(cls, v):
+        if not isinstance(v, str) or not HEX_RE.fullmatch(v):
+            raise ValueError("Invalid embed colour")
+        return v
+
+    @field_validator("url", "author_url", "author_icon", "image", "thumbnail", "footer_icon")
+    @classmethod
+    def valid_links(cls, v):
+        return check_https(v, "Embed link")
+
+
+class ReplyModel(StrictModel):
+    id: str
+    name: str = Field(default="", max_length=100)
+    blocks: list[TopBlock] = Field(default_factory=list, max_length=40)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "reply")
+
+
+class FormFieldModel(StrictModel):
+    id: str
+    label: str = Field(default="", max_length=45)
+    style: Literal["short", "paragraph"] = "short"
+    placeholder: str = Field(default="", max_length=100)
+    required: StrictBool = True
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "question")
+
+
+class FormModel(StrictModel):
+    id: str
+    name: str = Field(default="", max_length=100)
+    title: str = Field(default="", max_length=45)
+    channel_id: str = ""
+    thanks: str = Field(default="", max_length=1900)
+    fields: list[FormFieldModel] = Field(default_factory=list, max_length=5)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, v):
+        return check_id(v, "form")
+
+    @field_validator("channel_id")
+    @classmethod
+    def valid_chan(cls, v):
+        return check_digits(v, "channel")
+
+
+def count_v2_components(blocks) -> int:
+    total = 0
+    for b in blocks:
+        total += 1
+        if b.type == "box":
+            total += count_v2_components(b.children)
+        elif b.type == "button_row":
+            total += len(b.buttons)
+        elif b.type == "dropdown":
+            total += 1
+        elif b.type == "section":
+            total += 2
+    return total
+
+
+def count_v2_chars(blocks) -> int:
+    total = 0
+    for b in blocks:
+        if b.type in ("text", "section"):
+            total += len(b.content)
+        elif b.type == "box":
+            total += count_v2_chars(b.children)
+    return total
+
+
+def check_v2_limits(blocks, label: str):
+    if count_v2_components(blocks) > 40:
+        raise ValueError(f"{label} cannot have more than 40 components")
+    if count_v2_chars(blocks) > 4000:
+        raise ValueError(f"{label} cannot have more than 4000 text characters")
+
+
+class LayoutModel(StrictModel):
+    kind: Literal["layout", "classic"] = "layout"
+    guild_id: Optional[str] = ""
+    blocks: list[TopBlock] = Field(default_factory=list, max_length=40)
+    content: str = Field(default="", max_length=2000)
+    embeds: list[EmbedModel] = Field(default_factory=list, max_length=10)
+    replies: list[ReplyModel] = Field(default_factory=list, max_length=25)
+    forms: list[FormModel] = Field(default_factory=list, max_length=25)
+
+    @field_validator("guild_id")
+    @classmethod
+    def valid_guild(cls, v):
+        return check_digits(v, "server id")
+
+    @model_validator(mode="after")
+    def check_limits(self):
+        if self.kind == "classic":
+            if len(self.blocks) > 5:
+                raise ValueError("Max 5 rows of buttons and dropdowns")
+            for b in self.blocks:
+                if b.type not in ("button_row", "dropdown"):
+                    raise ValueError("Classic messages only support buttons and dropdowns")
+            total = sum(
+                len(e.title)
+                + len(e.description)
+                + len(e.author_name)
+                + len(e.footer_text)
+                + sum(len(f.name) + len(f.value) for f in e.fields)
+                for e in self.embeds
+            )
+            if total > 6000:
+                raise ValueError("Embeds cannot exceed 6000 characters in total")
+        else:
+            check_v2_limits(self.blocks, "Main message")
+        for r in self.replies:
+            check_v2_limits(r.blocks, f'Reply "{r.name or r.id}"')
+        return self
 
 
 def bad(msg):
     raise HTTPException(400, msg)
 
 
-def v_id(x, what):
-    if not isinstance(x, str) or not ID_RE.match(x):
-        bad("Invalid " + what + " id")
-
-
-def v_str(x, what, limit):
-    if not isinstance(x, str):
-        bad(what + " must be text")
-    if len(x) > limit:
-        bad(what + " is too long")
-
-
 def v_url(x, what):
-    v_str(x, what, 2000)
-    if x and not x.startswith("https://"):
-        bad(what + " must start with https://")
-
-
-def v_digits(x, what):
-    if x == "":
-        return
-    if not isinstance(x, str) or not x.isdigit() or len(x) > 25:
-        bad("Invalid " + what)
-
-
-def v_emoji(e):
-    if e is None:
-        return
-    if not isinstance(e, dict):
-        bad("Invalid emoji")
-    eid = str(e.get("id", ""))
-    name = str(e.get("name", ""))
-    if not eid.isdigit() or len(eid) > 25 or not re.match(r"^\w{1,32}$", name):
-        bad("Invalid emoji")
-
-
-def v_action(a):
-    if not isinstance(a, dict):
-        bad("Invalid action")
-    kind = a.get("type")
-    if kind == "link":
-        v_url(a.get("url", ""), "Link")
-    elif kind in ("reply", "form"):
-        ref = a.get("reply_id" if kind == "reply" else "form_id", "")
-        if ref != "":
-            v_id(ref, kind)
-    elif kind == "role":
-        v_digits(a.get("role_id", ""), "role")
-        if a.get("mode", "toggle") not in ("toggle", "add", "remove"):
-            bad("Invalid role mode")
-    else:
-        bad("Unknown action type")
-
-
-def v_rules(x):
-    roles = x.get("allowed_roles", [])
-    if not isinstance(roles, list) or len(roles) > 10:
-        bad("Too many allowed roles")
-    for r in roles:
-        if not isinstance(r, str) or not r.isdigit() or len(r) > 25:
-            bad("Invalid role")
-    cd = x.get("cooldown", 0)
-    if not isinstance(cd, int) or isinstance(cd, bool) or not 0 <= cd <= 86400:
-        bad("Cooldown must be 0 to 86400 seconds")
-    if not isinstance(x.get("once", False), bool):
-        bad("Invalid one-use setting")
-
-
-def v_button(b):
-    if not isinstance(b, dict):
-        bad("Invalid button")
-    v_id(b.get("id"), "button")
-    v_str(b.get("label", ""), "Button label", 80)
-    if b.get("style", "grey") not in BUTTON_STYLES:
-        bad("Invalid button colour")
-    v_emoji(b.get("emoji"))
-    v_action(b.get("action") or {"type": "link", "url": b.get("url", "")})
-    v_rules(b)
-
-
-def v_block(b, in_box=False):
-    if not isinstance(b, dict):
-        bad("Invalid part")
-    v_id(b.get("id"), "part")
-    kind = b.get("type")
-    if kind not in BLOCK_TYPES:
-        bad("Unknown part type")
-
-    if kind == "text":
-        v_str(b.get("content", ""), "Text", 8000)
-
-    elif kind == "section":
-        v_str(b.get("content", ""), "Text", 8000)
-        side = b.get("side", "button")
-        if side not in ("button", "thumbnail"):
-            bad("Invalid side option")
-        if side == "thumbnail":
-            v_url(b.get("image", ""), "Thumbnail link")
-        else:
-            v_button(b.get("button"))
-
-    elif kind == "images":
-        urls = b.get("urls", [])
-        if not isinstance(urls, list) or len(urls) > 20:
-            bad("Too many images in one part")
-        for u in urls:
-            v_url(u, "Image link")
-
-    elif kind == "divider":
-        if b.get("spacing", "small") not in ("small", "large"):
-            bad("Invalid divider spacing")
-
-    elif kind == "box":
-        if in_box:
-            bad("A box can't contain another box")
-        if not re.match(r"^#[0-9a-fA-F]{6}$", str(b.get("accent", "#5865F2"))):
-            bad("Invalid box colour")
-        kids = b.get("children", [])
-        if not isinstance(kids, list) or len(kids) > 40:
-            bad("Too many parts in a box")
-        for c in kids:
-            v_block(c, True)
-
-    elif kind == "button_row":
-        btns = b.get("buttons", [])
-        if not isinstance(btns, list) or len(btns) > 10:
-            bad("Too many buttons in a row")
-        for x in btns:
-            v_button(x)
-
-    elif kind == "dropdown":
-        v_str(b.get("placeholder", ""), "Placeholder", 150)
-        opts = b.get("options", [])
-        if not isinstance(opts, list) or len(opts) > 50:
-            bad("Too many dropdown options")
-        for o in opts:
-            if not isinstance(o, dict):
-                bad("Invalid option")
-            v_id(o.get("id"), "option")
-            v_str(o.get("label", ""), "Option label", 100)
-            v_str(o.get("description", ""), "Option description", 100)
-            v_emoji(o.get("emoji"))
-            v_action(o.get("action"))
-            v_rules(o)
-
-
-def v_embed(e):
-    if not isinstance(e, dict):
-        bad("Invalid embed")
-    v_id(e.get("id"), "embed")
-    for key, limit in (
-        ("title", 256),
-        ("description", 4096),
-        ("author_name", 256),
-        ("footer_text", 2048)
-    ):
-        v_str(e.get(key, ""), "Embed " + key.replace("_", " "), limit)
-
-    for key in ("url", "author_url", "author_icon", "image", "thumbnail", "footer_icon"):
-        v_url(e.get(key, ""), "Embed link")
-
-    if not re.match(r"^#[0-9a-fA-F]{6}$", str(e.get("color", "#5865F2"))):
-        bad("Invalid embed colour")
-
-    fields = e.get("fields", [])
-    if not isinstance(fields, list) or len(fields) > 25:
-        bad("Too many embed fields")
-
-    for f in fields:
-        if not isinstance(f, dict):
-            bad("Invalid embed field")
-        v_id(f.get("id"), "field")
-        v_str(f.get("name", ""), "Field name", 256)
-        v_str(f.get("value", ""), "Field value", 1024)
-
-
-def v_blocks(blocks):
-    if not isinstance(blocks, list) or len(blocks) > 40:
-        bad("Too many parts")
-    for b in blocks:
-        v_block(b)
+    try:
+        check_https(x, what)
+    except ValueError as err:
+        bad(str(err))
 
 
 def check_layout(layout):
@@ -266,59 +519,15 @@ def check_layout(layout):
         bad("layout must be an object")
     if len(json.dumps(layout)) > 200000:
         bad("Message is too large")
-
-    v_digits(str(layout.get("guild_id") or ""), "server id")
-
-    kind = layout.get("kind", "layout")
-    if kind not in ("layout", "classic"):
-        bad("Unknown message kind")
-
-    if kind == "classic":
-        v_str(layout.get("content", ""), "Message text", 2000)
-        embeds = layout.get("embeds", [])
-        if not isinstance(embeds, list) or len(embeds) > 10:
-            bad("A message can have at most 10 embeds")
-        for e in embeds:
-            v_embed(e)
-
-    v_blocks(layout.get("blocks"))
-
-    replies = layout.get("replies", [])
-    if not isinstance(replies, list) or len(replies) > 25:
-        bad("replies must be a list of at most 25")
-
-    for r in replies:
-        if not isinstance(r, dict):
-            bad("Invalid reply")
-        v_id(r.get("id"), "reply")
-        v_str(r.get("name", ""), "Reply name", 100)
-        v_blocks(r.get("blocks", []))
-
-    forms = layout.get("forms", [])
-    if not isinstance(forms, list) or len(forms) > 25:
-        bad("forms must be a list of at most 25")
-
-    for f in forms:
-        if not isinstance(f, dict):
-            bad("Invalid form")
-        v_id(f.get("id"), "form")
-        v_str(f.get("name", ""), "Form name", 100)
-        v_str(f.get("title", ""), "Form title", 100)
-        v_str(f.get("thanks", ""), "Thank-you text", 2000)
-        v_digits(f.get("channel_id", ""), "channel")
-
-        fields = f.get("fields", [])
-        if not isinstance(fields, list) or len(fields) > 10:
-            bad("Too many form questions")
-
-        for q in fields:
-            if not isinstance(q, dict):
-                bad("Invalid question")
-            v_id(q.get("id"), "question")
-            v_str(q.get("label", ""), "Question label", 100)
-            v_str(q.get("placeholder", ""), "Hint text", 200)
-            if q.get("style", "short") not in ("short", "paragraph"):
-                bad("Invalid question size")
+    try:
+        LayoutModel.model_validate(layout)
+    except ValidationError as err:
+        first = err.errors()[0]
+        msg = first.get("msg", "Invalid message layout")
+        if msg.startswith("Value error, "):
+            msg = msg[13:]
+        loc = ".".join(str(x) for x in first.get("loc", []))
+        bad(f"{msg} ({loc})" if loc else msg)
 
 
 def clean_name(name):
@@ -657,7 +866,7 @@ def make_router(require_user, get_client, owner_id):
 
         try:
             user = await get_client().fetch_user(int(uid))
-            await user.send(**payload)
+            await user.send(**payload, allowed_mentions=SAFE_MENTIONS)
         except discord.Forbidden:
             raise HTTPException(
                 400,
@@ -956,6 +1165,8 @@ def make_router(require_user, get_client, owner_id):
     @router.delete("/admin/pending/{guild_id}")
     async def admin_dismiss(guild_id: str, authorization: str = Header(default=None)):
         require_owner_user(authorization)
+        if not guild_id.isdigit():
+            raise HTTPException(400, "Bad server id")
         db.remove_pending(guild_id)
         return {"ok": True}
 
