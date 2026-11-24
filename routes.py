@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 import access
+import automation
 import builder
 import db
 import timeutil
@@ -71,6 +72,35 @@ class ScheduleToggleIn(StrictModel):
 class WebhookCreateIn(StrictModel):
     name: str
 
+
+class AutomationIn(StrictModel):
+    welcome_enabled: StrictBool = False
+    welcome_channel_id: str = ""
+    welcome_message_id: StrictInt = 0
+    goodbye_enabled: StrictBool = False
+    goodbye_channel_id: str = ""
+    goodbye_message_id: StrictInt = 0
+
+
+class KeywordIn(StrictModel):
+    phrase: str
+    match_type: Literal["contains", "exact", "starts"] = "contains"
+    message_id: StrictInt
+    channel_id: str = ""
+    cooldown: StrictInt = Field(default=10, ge=1, le=86400)
+
+
+class FeedIn(StrictModel):
+    kind: Literal["rss", "youtube", "reddit"] = "rss"
+    url: str
+    channel_id: str
+    message_id: StrictInt
+
+
+class StickyIn(StrictModel):
+    channel_id: str
+    message_id: StrictInt
+    delay_seconds: StrictInt = Field(default=5, ge=3, le=60)
 
 class ResponseDecideIn(StrictModel):
     decision: Literal["accepted", "denied"]
@@ -1621,5 +1651,89 @@ def make_router(require_user, get_client, owner_id):
                 pass
 
         return updated
+
+    # ----- Automation (Phase 7) -----
+
+    @router.get("/guilds/{guild_id}/automation")
+    async def get_guild_automation(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        return {
+            "settings": db.get_automation(guild_id),
+            "keywords": db.list_keywords(guild_id),
+            "feeds": db.list_feeds(guild_id),
+            "stickies": db.list_stickies(guild_id),
+        }
+
+    @router.put("/guilds/{guild_id}/automation")
+    async def save_guild_automation(guild_id: str, body: AutomationIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        return db.save_automation(guild_id, body.model_dump())
+
+    @router.post("/guilds/{guild_id}/keywords")
+    async def add_keyword(guild_id: str, body: KeywordIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        if len(db.list_keywords(guild_id)) >= 50:
+            bad("Max 50 keyword rules per server")
+        phrase = body.phrase.strip()[:100]
+        if not phrase:
+            bad("Keyword phrase is required")
+        row = db.create_keyword(guild_id, phrase, body.match_type, body.message_id, body.channel_id, body.cooldown)
+        automation.reload_keywords()
+        return row
+
+    @router.delete("/keywords/{rule_id}")
+    async def remove_keyword(rule_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        row = db.get_keyword(rule_id)
+        if not row:
+            raise HTTPException(404, "Rule not found")
+        await user_guild(uid, row["guild_id"])
+        db.delete_keyword(rule_id)
+        automation.reload_keywords()
+        return {"deleted": True}
+
+    @router.post("/guilds/{guild_id}/feeds")
+    async def add_feed(guild_id: str, body: FeedIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        if len(db.list_feeds(guild_id)) >= 20:
+            bad("Max 20 feeds per server")
+        url = body.url.strip()
+        if not url.startswith("https://") or not automation.is_safe_public_url(url):
+            bad("Feed URL must be a safe public https:// URL")
+        return db.create_feed(guild_id, body.kind, url, body.channel_id, body.message_id)
+
+    @router.delete("/feeds/{feed_id}")
+    async def remove_feed(feed_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        row = db.get_feed(feed_id)
+        if not row:
+            raise HTTPException(404, "Feed not found")
+        await user_guild(uid, row["guild_id"])
+        db.delete_feed(feed_id)
+        return {"deleted": True}
+
+    @router.post("/guilds/{guild_id}/stickies")
+    async def add_sticky(guild_id: str, body: StickyIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        find_channel(get_client(), guild_id, body.channel_id)
+        row = db.set_sticky(guild_id, body.channel_id, body.message_id, body.delay_seconds)
+        automation.reload_stickies()
+        return row
+
+    @router.delete("/stickies/{sticky_id}")
+    async def remove_sticky(sticky_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        row = db.get_sticky(sticky_id)
+        if not row:
+            raise HTTPException(404, "Sticky not found")
+        await user_guild(uid, row["guild_id"])
+        db.delete_sticky(sticky_id)
+        automation.reload_stickies()
+        return {"deleted": True}
 
     return router

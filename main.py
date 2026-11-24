@@ -14,6 +14,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 
 import access
+import automation
+import builder
+import variables
 import db
 import interactions
 import scheduler
@@ -219,7 +222,40 @@ app.include_router(make_router(require_user, lambda: client, OWNER_ID))
 
 
 class EmbedBot(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tree = discord.app_commands.CommandTree(self)
+
     async def setup_hook(self):
+        @self.tree.command(name="embed_list", description="List saved dashboard messages for this server")
+        async def cmd_embed_list(inter: discord.Interaction):
+            if not inter.guild or not inter.user.guild_permissions.administrator:
+                await inter.response.send_message("Only server Administrators can use this.", ephemeral=True)
+                return
+            msgs = db.list_messages([str(inter.guild.id)])
+            if not msgs:
+                await inter.response.send_message("No saved messages for this server yet.", ephemeral=True)
+                return
+            lines = [f"- **{m['id']}**: {m['name']}" for m in msgs[:25]]
+            await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+        @self.tree.command(name="embed_send", description="Post a saved dashboard message to this channel")
+        @discord.app_commands.describe(message_id="The numeric message ID from /embed_list")
+        async def cmd_embed_send(inter: discord.Interaction, message_id: int):
+            if not inter.guild or not inter.user.guild_permissions.administrator:
+                await inter.response.send_message("Only server Administrators can use this.", ephemeral=True)
+                return
+            m = db.get_message(message_id)
+            if not m or str(m.get("guild_id")) != str(inter.guild.id):
+                await inter.response.send_message("Message not found for this server.", ephemeral=True)
+                return
+            resolved = variables.resolve_layout(m["layout"], guild=inter.guild, channel=inter.channel, user=inter.user)
+            payload = builder.build_payload(resolved, m["id"])
+            sent = await inter.channel.send(**payload, allowed_mentions=discord.AllowedMentions(everyone=False, roles=True, users=True, replied_user=False))
+            db.set_posted(m["id"], str(inter.guild.id), str(inter.channel.id), str(sent.id))
+            await inter.response.send_message(f"Posted **{m['name']}**!", ephemeral=True)
+
+        await self.tree.sync()
         port = int(get_setting("SERVER_PORT") or get_setting("PORT") or 8080)
         config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
         self.api_server = uvicorn.Server(config)
@@ -253,9 +289,21 @@ class EmbedBot(discord.Client):
     async def on_interaction(self, interaction):
         await interactions.handle(interaction)
 
+    async def on_member_join(self, member):
+        await automation.handle_member_event(member, "welcome")
+
+    async def on_member_remove(self, member):
+        await automation.handle_member_event(member, "goodbye")
+
+    async def on_message(self, message):
+        await automation.handle_message(self, message)
+
 
 db.init_db()
-client = EmbedBot(intents=discord.Intents.default())
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+client = EmbedBot(intents=intents)
 
 token = get_setting("BOT_TOKEN")
 if not token:

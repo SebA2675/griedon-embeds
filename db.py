@@ -180,7 +180,66 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sequences_guild ON sequences(guild_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS automation_settings (
+                guild_id TEXT PRIMARY KEY,
+                welcome_enabled INTEGER NOT NULL DEFAULT 0,
+                welcome_channel_id TEXT NOT NULL DEFAULT '',
+                welcome_message_id INTEGER NOT NULL DEFAULT 0,
+                goodbye_enabled INTEGER NOT NULL DEFAULT 0,
+                goodbye_channel_id TEXT NOT NULL DEFAULT '',
+                goodbye_message_id INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS keyword_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                phrase TEXT NOT NULL,
+                match_type TEXT NOT NULL DEFAULT 'contains',
+                message_id INTEGER NOT NULL,
+                channel_id TEXT NOT NULL DEFAULT '',
+                cooldown INTEGER NOT NULL DEFAULT 10,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feeds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'rss',
+                url TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                last_seen TEXT NOT NULL DEFAULT '',
+                last_check INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stickies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL UNIQUE,
+                message_id INTEGER NOT NULL,
+                last_posted_id TEXT NOT NULL DEFAULT '',
+                delay_seconds INTEGER NOT NULL DEFAULT 5,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_form_resp_msg ON form_responses(message_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_kw_guild ON keyword_rules(guild_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_feeds_guild ON feeds(guild_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_message ON schedules(message_id)")
@@ -935,3 +994,172 @@ def set_form_response_status(resp_id, status):
         conn.execute("UPDATE form_responses SET status = ? WHERE id = ?", (status, resp_id))
         conn.commit()
     return get_form_response(resp_id)
+def get_automation(guild_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM automation_settings WHERE guild_id = ?", (str(guild_id),)).fetchone()
+    if not row:
+        return {
+            "guild_id": str(guild_id),
+            "welcome_enabled": False,
+            "welcome_channel_id": "",
+            "welcome_message_id": 0,
+            "goodbye_enabled": False,
+            "goodbye_channel_id": "",
+            "goodbye_message_id": 0,
+        }
+    d = dict(row)
+    d["welcome_enabled"] = bool(d["welcome_enabled"])
+    d["goodbye_enabled"] = bool(d["goodbye_enabled"])
+    return d
+
+
+def save_automation(guild_id, data):
+    with closing(connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO automation_settings (
+                guild_id, welcome_enabled, welcome_channel_id, welcome_message_id,
+                goodbye_enabled, goodbye_channel_id, goodbye_message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                welcome_enabled = excluded.welcome_enabled,
+                welcome_channel_id = excluded.welcome_channel_id,
+                welcome_message_id = excluded.welcome_message_id,
+                goodbye_enabled = excluded.goodbye_enabled,
+                goodbye_channel_id = excluded.goodbye_channel_id,
+                goodbye_message_id = excluded.goodbye_message_id
+            """,
+            (
+                str(guild_id),
+                1 if data.get("welcome_enabled") else 0,
+                str(data.get("welcome_channel_id") or ""),
+                int(data.get("welcome_message_id") or 0),
+                1 if data.get("goodbye_enabled") else 0,
+                str(data.get("goodbye_channel_id") or ""),
+                int(data.get("goodbye_message_id") or 0),
+            ),
+        )
+        conn.commit()
+    return get_automation(guild_id)
+
+
+def list_keywords(guild_id=None):
+    with closing(connect()) as conn:
+        if guild_id is None:
+            rows = conn.execute("SELECT * FROM keyword_rules WHERE enabled = 1").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM keyword_rules WHERE guild_id = ? ORDER BY id DESC", (str(guild_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_keyword(guild_id, phrase, match_type, message_id, channel_id="", cooldown=10):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO keyword_rules (guild_id, phrase, match_type, message_id, channel_id, cooldown, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (str(guild_id), phrase[:100], match_type, int(message_id), str(channel_id or ""), int(cooldown), now),
+        )
+        conn.commit()
+        kid = cur.lastrowid
+        row = conn.execute("SELECT * FROM keyword_rules WHERE id = ?", (kid,)).fetchone()
+    return dict(row)
+
+
+def get_keyword(rule_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM keyword_rules WHERE id = ?", (rule_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_keyword(rule_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM keyword_rules WHERE id = ?", (rule_id,))
+        conn.commit()
+
+
+def list_feeds(guild_id=None):
+    with closing(connect()) as conn:
+        if guild_id is None:
+            rows = conn.execute("SELECT * FROM feeds").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM feeds WHERE guild_id = ? ORDER BY id DESC", (str(guild_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_feed(guild_id, kind, url, channel_id, message_id):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO feeds (guild_id, kind, url, channel_id, message_id, last_seen, last_check, last_error, created_at) VALUES (?, ?, ?, ?, ?, '', 0, '', ?)",
+            (str(guild_id), kind, url[:500], str(channel_id), int(message_id), now),
+        )
+        conn.commit()
+        fid = cur.lastrowid
+        row = conn.execute("SELECT * FROM feeds WHERE id = ?", (fid,)).fetchone()
+    return dict(row)
+
+
+def get_feed(feed_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM feeds WHERE id = ?", (feed_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_feed_state(feed_id, last_seen, last_check, last_error=""):
+    with closing(connect()) as conn:
+        conn.execute(
+            "UPDATE feeds SET last_seen = ?, last_check = ?, last_error = ? WHERE id = ?",
+            (str(last_seen)[:300], int(last_check), str(last_error)[:200], feed_id),
+        )
+        conn.commit()
+
+
+def delete_feed(feed_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM feeds WHERE id = ?", (feed_id,))
+        conn.commit()
+
+
+def list_stickies(guild_id=None):
+    with closing(connect()) as conn:
+        if guild_id is None:
+            rows = conn.execute("SELECT * FROM stickies").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM stickies WHERE guild_id = ? ORDER BY id DESC", (str(guild_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_sticky(guild_id, channel_id, message_id, delay_seconds=5):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO stickies (guild_id, channel_id, message_id, last_posted_id, delay_seconds, created_at)
+            VALUES (?, ?, ?, '', ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                message_id = excluded.message_id,
+                delay_seconds = excluded.delay_seconds
+            """,
+            (str(guild_id), str(channel_id), int(message_id), int(delay_seconds), now),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM stickies WHERE channel_id = ?", (str(channel_id),)).fetchone()
+    return dict(row)
+
+
+def update_sticky_posted(channel_id, posted_id):
+    with closing(connect()) as conn:
+        conn.execute("UPDATE stickies SET last_posted_id = ? WHERE channel_id = ?", (str(posted_id), str(channel_id)))
+        conn.commit()
+
+
+def get_sticky(sticky_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM stickies WHERE id = ?", (sticky_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_sticky(sticky_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM stickies WHERE id = ?", (sticky_id,))
+        conn.commit()

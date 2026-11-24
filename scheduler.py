@@ -5,6 +5,7 @@ import time
 import discord
 from fastapi import HTTPException
 
+import automation
 import backup
 import db
 import timeutil
@@ -185,6 +186,11 @@ async def run_loop(client):
             await maybe_cleanup()
         except Exception as err:
             print("Cleanup error:", type(err).__name__)
+
+        try:
+            await automation.check_feeds(client)
+        except Exception as err:
+            print("Feeds error:", type(err).__name__)
 
         try:
             await backup.maybe_backup()
