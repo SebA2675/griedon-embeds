@@ -47,7 +47,7 @@ def check_action(action, ctx):
             raise ValueError("A role action has a bad mode")
     elif kind == "page":
         idx = action.get("page_index", 0)
-        if not isinstance(idx, int) or idx < -2 or idx >= ctx.get("page_count", 0):
+        if not isinstance(idx, int) or idx < -2 or idx > ctx.get("page_count", 0):
             raise ValueError("Something points to a page that doesn't exist")
     else:
         raise ValueError("Unknown action")
@@ -330,7 +330,34 @@ def build_classic(layout, ctx):
     return {"content": content or None, "embeds": embeds, "view": view}
 
 
-def build_payload(layout, message_id, page_index=None):
+def _has_page_nav(blocks):
+    for b in blocks:
+        if b.get("type") == "button_row":
+            if any((btn.get("action") or {}).get("type") == "page" for btn in b.get("buttons", [])):
+                return True
+        elif b.get("type") == "dropdown":
+            if any((o.get("action") or {}).get("type") == "page" for o in b.get("options", [])):
+                return True
+        elif b.get("type") == "box":
+            if _has_page_nav(b.get("children", [])):
+                return True
+    return False
+
+
+def _nav_rows(blocks):
+    rows = []
+    for b in blocks:
+        t = b.get("type")
+        if t == "button_row" and any((btn.get("action") or {}).get("type") == "page" for btn in b.get("buttons", [])):
+            rows.append(b)
+        elif t == "dropdown" and any((o.get("action") or {}).get("type") == "page" for o in b.get("options", [])):
+            rows.append(b)
+        elif t == "box":
+            rows.extend(_nav_rows(b.get("children", [])))
+    return rows
+
+
+def build_payload(layout, message_id, page_index=0):
     ctx = make_ctx(layout, message_id)
     for form in layout.get("forms", []):
         check_form(form)
@@ -338,14 +365,18 @@ def build_payload(layout, message_id, page_index=None):
         view_from_blocks(reply.get("blocks", []), ctx)
     pages = layout.get("pages") or []
     effective = layout
-    if page_index is not None and pages and 0 <= page_index < len(pages):
-        p = pages[page_index]
+    # page_index 0 = Main message; 1..len(pages) = pages[0..len(pages)-1]
+    if page_index and pages and 1 <= page_index <= len(pages):
+        p = pages[page_index - 1]
         effective = dict(layout)
         if layout.get("kind") == "classic":
             effective["content"] = p.get("content", "")
             effective["embeds"] = p.get("embeds", [])
         else:
-            effective["blocks"] = p.get("blocks", [])
+            p_blocks = list(p.get("blocks", []))
+            if not _has_page_nav(p_blocks):
+                p_blocks.extend(_nav_rows(layout.get("blocks", [])))
+            effective["blocks"] = p_blocks
     if effective.get("kind") == "classic":
         return build_classic(effective, ctx)
     return {"view": view_from_blocks(effective.get("blocks", []), ctx)}

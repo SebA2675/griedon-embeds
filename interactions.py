@@ -142,18 +142,19 @@ async def run_action(interaction, message, action, on_done=None):
         await interaction.response.send_modal(forms.FormModal(form, on_done))
     elif kind == "page":
         pages = message["layout"].get("pages") or []
-        if not pages:
-            await say(interaction, "This message has no pages.")
+        total = 1 + len(pages)
+        if total <= 1:
+            await say(interaction, "This message only has 1 page.")
             return
         msg_id = interaction.message.id if interaction.message else 0
         cur_idx = _page_state.get(msg_id, 0)
         req = int(action.get("page_index", 0))
         if req == -2:
-            target = (cur_idx + 1) % len(pages)
+            target = (cur_idx + 1) % total
         elif req == -1:
-            target = (cur_idx - 1) % len(pages)
+            target = (cur_idx - 1) % total
         else:
-            target = max(0, min(req, len(pages) - 1))
+            target = max(0, min(req, total - 1))
         _page_state[msg_id] = target
         resolved = variables.resolve_layout(
             message["layout"],
