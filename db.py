@@ -216,6 +216,31 @@ def get_message(message_id):
     return to_dict(row) if row else None
 
 
+CACHE_SECONDS = 60
+_cache = {}
+
+
+def forget(message_id):
+    _cache.pop(int(message_id), None)
+
+
+def get_message_cached(message_id):
+    """For button clicks only: a message kept in memory for about a minute."""
+    message_id = int(message_id)
+    hit = _cache.get(message_id)
+    now = time.time()
+    if hit and now - hit[0] < CACHE_SECONDS:
+        return hit[1]
+    message = get_message(message_id)
+    if message is None:
+        _cache.pop(message_id, None)
+        return None
+    if len(_cache) > 200:
+        _cache.clear()
+    _cache[message_id] = (now, message)
+    return message
+
+
 def create_message(name, layout, guild_id):
     now = int(time.time())
     text = json.dumps(layout)
@@ -231,6 +256,7 @@ def create_message(name, layout, guild_id):
 
 
 def update_message(message_id, name, layout, guild_id):
+    forget(message_id)
     text = json.dumps(layout)
     with closing(connect()) as conn:
         cur = conn.execute(
@@ -254,6 +280,7 @@ def update_message(message_id, name, layout, guild_id):
 
 
 def delete_message(message_id):
+    forget(message_id)
     with closing(connect()) as conn:
         cur = conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
         conn.execute("DELETE FROM versions WHERE message_id = ?", (message_id,))
@@ -264,6 +291,7 @@ def delete_message(message_id):
 
 
 def set_posted(message_id, guild_id, channel_id, posted_message_id):
+    forget(message_id)
     with closing(connect()) as conn:
         conn.execute(
             "UPDATE messages SET guild_id = ?, channel_id = ?, posted_message_id = ?, webhook_id = NULL WHERE id = ?",
@@ -273,6 +301,7 @@ def set_posted(message_id, guild_id, channel_id, posted_message_id):
 
 
 def set_posted_via_webhook(message_id, guild_id, channel_id, posted_message_id, webhook_id):
+    forget(message_id)
     with closing(connect()) as conn:
         conn.execute(
             "UPDATE messages SET guild_id = ?, channel_id = ?, posted_message_id = ?, webhook_id = ? WHERE id = ?",
@@ -282,6 +311,7 @@ def set_posted_via_webhook(message_id, guild_id, channel_id, posted_message_id, 
 
 
 def clear_posted(message_id):
+    forget(message_id)
     with closing(connect()) as conn:
         conn.execute("UPDATE messages SET posted_message_id = NULL, webhook_id = NULL WHERE id = ?", (message_id,))
         conn.commit()

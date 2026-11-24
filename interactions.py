@@ -167,7 +167,7 @@ async def handle(interaction):
     if len(parts) != 3 or parts[0] != "m" or not parts[1].isdigit():
         return
     try:
-        message = db.get_message(int(parts[1]))
+        message = db.get_message_cached(int(parts[1]))
         if not message:
             await say(interaction, "This message was deleted from the dashboard.")
             return
