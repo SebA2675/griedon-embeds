@@ -239,13 +239,50 @@ def init_db():
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_form_resp_msg ON form_responses(message_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_kw_guild ON keyword_rules(guild_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS server_settings (
+                guild_id TEXT PRIMARY KEY,
+                default_color TEXT NOT NULL DEFAULT '#5865F2',
+                default_footer TEXT NOT NULL DEFAULT '',
+                logo_url TEXT NOT NULL DEFAULT '',
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_editors (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_feeds_guild ON feeds(guild_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_guild ON audit_log(guild_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_message ON schedules(message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_templates_guild ON templates(guild_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_personas_guild ON webhook_personas(guild_id)")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "deleted_at" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0")
         if "webhook_id" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN webhook_id TEXT")
         for col in ("layout_hash", "version_hash"):
@@ -303,13 +340,13 @@ def to_dict(row, full=True):
 def list_messages(guild_ids=None):
     with closing(connect()) as conn:
         if guild_ids is None:
-            rows = conn.execute("SELECT * FROM messages ORDER BY updated_at DESC").fetchall()
+            rows = conn.execute("SELECT * FROM messages WHERE deleted_at = 0 ORDER BY updated_at DESC").fetchall()
         elif not guild_ids:
             return []
         else:
             marks = ",".join("?" for _ in guild_ids)
             rows = conn.execute(
-                f"SELECT * FROM messages WHERE guild_id IN ({marks}) ORDER BY updated_at DESC",
+                f"SELECT * FROM messages WHERE deleted_at = 0 AND guild_id IN ({marks}) ORDER BY updated_at DESC",
                 list(guild_ids),
             ).fetchall()
     return [to_dict(r, full=False) for r in rows]
@@ -323,13 +360,13 @@ def list_messages_full(guild_id):
 
 def count_messages(guild_id):
     with closing(connect()) as conn:
-        row = conn.execute("SELECT COUNT(*) AS n FROM messages WHERE guild_id = ?", (guild_id,)).fetchone()
+        row = conn.execute("SELECT COUNT(*) AS n FROM messages WHERE deleted_at = 0 AND guild_id = ?", (guild_id,)).fetchone()
     return row["n"]
 
 
 def get_message(message_id):
     with closing(connect()) as conn:
-        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        row = conn.execute("SELECT * FROM messages WHERE id = ? AND deleted_at = 0", (message_id,)).fetchone()
     return to_dict(row) if row else None
 
 
@@ -398,11 +435,10 @@ def update_message(message_id, name, layout, guild_id):
 
 def delete_message(message_id):
     forget(message_id)
+    now = int(time.time())
     with closing(connect()) as conn:
-        cur = conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
-        conn.execute("DELETE FROM versions WHERE message_id = ?", (message_id,))
+        cur = conn.execute("UPDATE messages SET deleted_at = ? WHERE id = ?", (now, message_id))
         conn.execute("DELETE FROM schedules WHERE message_id = ?", (message_id,))
-        conn.execute("DELETE FROM button_uses WHERE message_id = ?", (message_id,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -1162,4 +1198,126 @@ def get_sticky(sticky_id):
 def delete_sticky(sticky_id):
     with closing(connect()) as conn:
         conn.execute("DELETE FROM stickies WHERE id = ?", (sticky_id,))
+        conn.commit()
+def list_trash(guild_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT id, name, guild_id, deleted_at, updated_at FROM messages WHERE guild_id = ? AND deleted_at > 0 ORDER BY deleted_at DESC",
+            (str(guild_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def restore_message(message_id):
+    with closing(connect()) as conn:
+        conn.execute("UPDATE messages SET deleted_at = 0 WHERE id = ?", (message_id,))
+        conn.commit()
+    return get_message(message_id)
+
+
+def purge_message(message_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        conn.execute("DELETE FROM versions WHERE message_id = ?", (message_id,))
+        conn.execute("DELETE FROM schedules WHERE message_id = ?", (message_id,))
+        conn.execute("DELETE FROM button_uses WHERE message_id = ?", (message_id,))
+        conn.execute("DELETE FROM click_counts WHERE message_id = ?", (message_id,))
+        conn.execute("DELETE FROM form_responses WHERE message_id = ?", (message_id,))
+        conn.commit()
+
+
+def log_audit(guild_id, user_id, action, detail=""):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT INTO audit_log (guild_id, user_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+            (str(guild_id or ""), str(user_id), str(action)[:60], str(detail)[:300], now),
+        )
+        conn.commit()
+
+
+def list_audit(guild_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE guild_id = ? ORDER BY created_at DESC LIMIT 100",
+            (str(guild_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_server_settings(guild_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM server_settings WHERE guild_id = ?", (str(guild_id),)).fetchone()
+    if not row:
+        return {"guild_id": str(guild_id), "default_color": "#5865F2", "default_footer": "", "logo_url": "", "timezone": "UTC", "updated_at": 0}
+    return dict(row)
+
+
+def save_server_settings(guild_id, data):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO server_settings (guild_id, default_color, default_footer, logo_url, timezone, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                default_color = excluded.default_color,
+                default_footer = excluded.default_footer,
+                logo_url = excluded.logo_url,
+                timezone = excluded.timezone,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(guild_id),
+                str(data.get("default_color") or "#5865F2")[:16],
+                str(data.get("default_footer") or "")[:300],
+                str(data.get("logo_url") or "")[:500],
+                str(data.get("timezone") or "UTC")[:64],
+                now,
+            ),
+        )
+        conn.commit()
+    return get_server_settings(guild_id)
+
+
+def is_editor(guild_id, user_id):
+    with closing(connect()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM guild_editors WHERE guild_id = ? AND user_id = ?",
+            (str(guild_id), str(user_id)),
+        ).fetchone()
+    return row is not None
+
+
+def list_editors(guild_id):
+    with closing(connect()) as conn:
+        rows = conn.execute("SELECT * FROM guild_editors WHERE guild_id = ? ORDER BY added_at DESC", (str(guild_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_editor(guild_id, user_id):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO guild_editors (guild_id, user_id, added_at) VALUES (?, ?, ?)",
+            (str(guild_id), str(user_id), now),
+        )
+        conn.commit()
+
+
+def remove_editor(guild_id, user_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM guild_editors WHERE guild_id = ? AND user_id = ?", (str(guild_id), str(user_id)))
+        conn.commit()
+
+
+def delete_guild_data(guild_id):
+    gid = str(guild_id)
+    with closing(connect()) as conn:
+        for tbl in (
+            "messages", "templates", "schedules", "webhook_personas", "sequences",
+            "form_responses", "automation_settings", "keyword_rules", "feeds",
+            "stickies", "audit_log", "server_settings", "guild_editors",
+        ):
+            conn.execute(f"DELETE FROM {tbl} WHERE guild_id = ?", (gid,))
         conn.commit()

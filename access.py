@@ -18,7 +18,7 @@ async def is_admin(user_id, guild):
     result = False
     try:
         member = guild.get_member(int(user_id)) or await guild.fetch_member(int(user_id))
-        result = bool(member.guild_permissions.administrator)
+        result = bool(member.guild_permissions.administrator or db.is_editor(guild.id, user_id))
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         result = False
     _cache[key] = (result, now + CACHE_SECONDS)

@@ -97,6 +97,21 @@ class FeedIn(StrictModel):
     message_id: StrictInt
 
 
+class ServerSettingsIn(StrictModel):
+    default_color: str = "#5865F2"
+    default_footer: str = ""
+    logo_url: str = ""
+    timezone: str = "UTC"
+
+
+class EditorIn(StrictModel):
+    user_id: str
+
+
+class BulkReplaceIn(StrictModel):
+    find: str
+    replace: str = ""
+
 class StickyIn(StrictModel):
     channel_id: str
     message_id: StrictInt
@@ -806,7 +821,10 @@ def make_router(require_user, get_client, owner_id):
     async def remove(message_id: int, authorization: str = Header(default=None)):
         uid = require_user(authorization)
         await load_message(message_id, uid)
+        found = db.get_message(message_id)
         db.delete_message(message_id)
+        if found:
+            db.log_audit(found["guild_id"], uid, "trash", f"Moved '{found['name']}' to trash")
         return {"deleted": True}
 
     # ----- Servers -----
@@ -1023,6 +1041,7 @@ def make_router(require_user, get_client, owner_id):
             raise discord_error(err)
 
         db.set_posted(message_id, found["guild_id"], str(dest_ch.id), str(sent.id))
+        db.log_audit(found["guild_id"], uid, "post", f"Posted '{found['name']}' to #{dest_ch.name}")
         db.add_version(message_id, found["name"], found["layout"])
         return db.get_message(message_id)
 
@@ -1734,6 +1753,123 @@ def make_router(require_user, get_client, owner_id):
         await user_guild(uid, row["guild_id"])
         db.delete_sticky(sticky_id)
         automation.reload_stickies()
+        return {"deleted": True}
+
+    # ----- Phase 8: Activity, Brand Kit, Trash, Editors, Bulk Replace, Data Rights -----
+
+    @router.get("/guilds/{guild_id}/activity")
+    async def guild_activity(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        return db.list_audit(guild_id)
+
+    @router.get("/guilds/{guild_id}/settings")
+    async def get_guild_settings(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        return db.get_server_settings(guild_id)
+
+    @router.put("/guilds/{guild_id}/settings")
+    async def put_guild_settings(guild_id: str, body: ServerSettingsIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        if not HEX_RE.fullmatch(body.default_color):
+            bad("Invalid default colour")
+        if body.logo_url:
+            v_url(body.logo_url, "Logo URL")
+        res = db.save_server_settings(guild_id, body.model_dump())
+        db.log_audit(guild_id, uid, "brand_kit", "Updated server Brand Kit")
+        return res
+
+    @router.get("/guilds/{guild_id}/trash")
+    async def list_guild_trash(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        return db.list_trash(guild_id)
+
+    @router.post("/messages/{message_id}/restore")
+    async def restore_trashed_message(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        with db.closing(db.connect()) as conn:
+            row = conn.execute("SELECT guild_id, name FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Message not found")
+        await user_guild(uid, row["guild_id"])
+        restored = db.restore_message(message_id)
+        db.log_audit(row["guild_id"], uid, "restore", f"Restored '{row['name']}' from trash")
+        return restored
+
+    @router.delete("/messages/{message_id}/purge")
+    async def purge_trashed_message(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        with db.closing(db.connect()) as conn:
+            row = conn.execute("SELECT guild_id, name FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Message not found")
+        await user_guild(uid, row["guild_id"])
+        db.purge_message(message_id)
+        db.log_audit(row["guild_id"], uid, "purge", f"Permanently deleted '{row['name']}'")
+        return {"deleted": True}
+
+    @router.get("/guilds/{guild_id}/editors")
+    async def list_guild_editors(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        return db.list_editors(guild_id)
+
+    @router.post("/guilds/{guild_id}/editors")
+    async def add_guild_editor(guild_id: str, body: EditorIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        target_uid = body.user_id.strip()
+        if not target_uid.isdigit():
+            bad("User ID must be numbers only")
+        db.add_editor(guild_id, target_uid)
+        db.log_audit(guild_id, uid, "editor_add", f"Added editor {target_uid}")
+        return {"ok": True}
+
+    @router.delete("/guilds/{guild_id}/editors/{target_uid}")
+    async def remove_guild_editor(guild_id: str, target_uid: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        db.remove_editor(guild_id, target_uid)
+        db.log_audit(guild_id, uid, "editor_remove", f"Removed editor {target_uid}")
+        return {"deleted": True}
+
+    @router.post("/guilds/{guild_id}/bulk-replace")
+    async def bulk_replace(guild_id: str, body: BulkReplaceIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        find = body.find
+        if not find:
+            bad("Search text cannot be empty")
+        msgs = db.list_messages_full(guild_id)
+        changed = 0
+
+        def _walk_replace(obj):
+            if isinstance(obj, list):
+                return [_walk_replace(x) for x in obj]
+            if isinstance(obj, dict):
+                return {k: _walk_replace(v) for k, v in obj.items()}
+            if isinstance(obj, str):
+                return obj.replace(find, body.replace)
+            return obj
+
+        for m in msgs:
+            old_str = json.dumps(m["layout"], sort_keys=True)
+            new_layout = _walk_replace(m["layout"])
+            if json.dumps(new_layout, sort_keys=True) != old_str:
+                check_layout(new_layout)
+                db.update_message(m["id"], m["name"], new_layout, guild_id)
+                changed += 1
+        db.log_audit(guild_id, uid, "bulk_replace", f"Replaced '{find[:30]}' in {changed} message(s)")
+        return {"updated": changed}
+
+    @router.delete("/guilds/{guild_id}/data")
+    async def wipe_guild_data(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        db.delete_guild_data(guild_id)
         return {"deleted": True}
 
     return router
