@@ -143,6 +143,17 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_guild ON messages(guild_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS access_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                guild_name TEXT NOT NULL,
+                username TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sequences_guild ON sequences(guild_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
@@ -768,4 +779,40 @@ def create_sequence(guild_id, name, message_ids):
 def delete_sequence(seq_id):
     with closing(connect()) as conn:
         conn.execute("DELETE FROM sequences WHERE id = ?", (seq_id,))
+        conn.commit()
+def guild_summary_stats():
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT guild_id, COUNT(*) AS cnt, MAX(updated_at) AS last_edit FROM messages GROUP BY guild_id"
+        ).fetchall()
+    return {str(r["guild_id"]): {"count": int(r["cnt"]), "last_edit": int(r["last_edit"] or 0)} for r in rows if r["guild_id"]}
+
+
+def list_access_requests():
+    with closing(connect()) as conn:
+        rows = conn.execute("SELECT * FROM access_requests ORDER BY created_at DESC LIMIT 100").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_access_request(req_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM access_requests WHERE id = ?", (req_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_access_request(guild_id, guild_name, username):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO access_requests (guild_id, guild_name, username, created_at) VALUES (?, ?, ?, ?)",
+            (str(guild_id), guild_name[:100], username[:100], now),
+        )
+        conn.commit()
+        rid = cur.lastrowid
+    return get_access_request(rid)
+
+
+def delete_access_request(req_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM access_requests WHERE id = ?", (req_id,))
         conn.commit()

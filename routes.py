@@ -4,7 +4,7 @@ import time
 from typing import Annotated, Literal, Optional, Union
 
 import discord
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -66,6 +66,12 @@ class SequenceIn(StrictModel):
 
 class SequencePostIn(StrictModel):
     channel_id: str
+
+
+class AccessRequestIn(StrictModel):
+    guild_id: str
+    guild_name: str
+    username: str
 
 
 class AllowIn(StrictModel):
@@ -715,7 +721,19 @@ def make_router(require_user, get_client, owner_id):
     async def guilds(authorization: str = Header(default=None)):
         uid = require_user(authorization)
         found = await access.accessible_guilds(get_client(), uid, owner_id)
-        return [{"id": str(g.id), "name": g.name} for g in found]
+        stats = db.guild_summary_stats()
+        out = []
+        for g in found:
+            gid = str(g.id)
+            st = stats.get(gid, {"count": 0, "last_edit": 0})
+            out.append({
+                "id": gid,
+                "name": g.name,
+                "icon_url": str(g.icon.url) if g.icon else "",
+                "message_count": st["count"],
+                "last_edit": st["last_edit"],
+            })
+        return out
 
     @router.get("/guilds/{guild_id}/channels")
     async def channels(guild_id: str, authorization: str = Header(default=None)):
@@ -1194,7 +1212,7 @@ def make_router(require_user, get_client, owner_id):
                 "joined": gid in joined
             })
 
-        return {"allowed": allowed, "pending": db.list_pending(), "storage": db.stats()}
+        return {"allowed": allowed, "pending": db.list_pending(), "requests": db.list_access_requests(), "storage": db.stats()}
 
     @router.post("/admin/allow")
     async def admin_allow(body: AllowIn, authorization: str = Header(default=None)):
@@ -1309,5 +1327,43 @@ def make_router(require_user, get_client, owner_id):
             db.add_version(mid, m["name"], m["layout"])
             posted += 1
         return {"posted": posted}
+
+    _req_times: dict[str, list[float]] = {}
+
+    @router.post("/request-access")
+    async def request_access(body: AccessRequestIn, request: Request):
+        ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "0")).split(",")[-1].strip()
+        now = time.time()
+        hits = [t for t in _req_times.get(ip, []) if now - t < 3600]
+        if len(hits) >= 10:
+            raise HTTPException(429, "Too many requests. Try again later.")
+        hits.append(now)
+        _req_times[ip] = hits
+
+        gid = body.guild_id.strip()
+        gname = body.guild_name.strip()[:100]
+        uname = body.username.strip()[:100]
+        if not gid.isdigit() or len(gid) < 15 or len(gid) > 25:
+            bad("Server ID must be a valid Discord server ID (numbers only)")
+        if not gname or not uname:
+            bad("Server name and Discord username are required")
+        db.create_access_request(gid, gname, uname)
+        return {"ok": True}
+
+    @router.post("/admin/requests/{req_id}/approve")
+    async def admin_approve_request(req_id: int, authorization: str = Header(default=None)):
+        require_owner_user(authorization)
+        req = db.get_access_request(req_id)
+        if not req:
+            raise HTTPException(404, "Request not found")
+        db.allow_guild(req["guild_id"], req["guild_name"])
+        db.delete_access_request(req_id)
+        return {"ok": True}
+
+    @router.delete("/admin/requests/{req_id}")
+    async def admin_dismiss_request(req_id: int, authorization: str = Header(default=None)):
+        require_owner_user(authorization)
+        db.delete_access_request(req_id)
+        return {"ok": True}
 
     return router
