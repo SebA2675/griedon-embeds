@@ -133,9 +133,21 @@ app.add_middleware(
 )
 
 
+_STARTED_AT = time.time()
+
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "bot": str(client.user) if client.user else None}
+    ready = bool(client.is_ready()) if client else False
+    lat = round(client.latency * 1000) if (ready and client.latency is not None) else None
+    return {
+        "ok": True,
+        "ready": ready,
+        "bot": str(client.user) if client.user else None,
+        "uptime_seconds": int(time.time() - _STARTED_AT),
+        "discord_latency_ms": lat,
+        "servers": len(client.guilds) if ready else 0,
+    }
 
 
 @app.get("/auth/login")
