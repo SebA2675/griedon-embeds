@@ -924,7 +924,7 @@ def make_router(require_user, get_client, owner_id):
                 "joined": gid in joined
             })
 
-        return {"allowed": allowed, "pending": db.list_pending()}
+        return {"allowed": allowed, "pending": db.list_pending(), "storage": db.stats()}
 
     @router.post("/admin/allow")
     async def admin_allow(body: AllowIn, authorization: str = Header(default=None)):

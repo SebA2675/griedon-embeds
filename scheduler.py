@@ -155,6 +155,20 @@ async def tick(client):
         print(f"Schedule {s['id']}: {status}")
 
 
+_last_cleanup = 0.0
+
+
+async def maybe_cleanup():
+    global _last_cleanup
+    now = time.time()
+    if now - _last_cleanup < 86400:
+        return
+    _last_cleanup = now
+    removed = await asyncio.to_thread(db.cleanup)
+    if removed:
+        print(f"Cleanup: removed {removed} leftover rows")
+
+
 async def run_loop(client):
     await client.wait_until_ready()
     print("Scheduler started.")
@@ -165,6 +179,11 @@ async def run_loop(client):
 
         except Exception as err:
             print("Scheduler error:", err)
+
+        try:
+            await maybe_cleanup()
+        except Exception as err:
+            print("Cleanup error:", type(err).__name__)
 
         try:
             await backup.maybe_backup()

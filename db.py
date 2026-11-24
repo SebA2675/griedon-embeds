@@ -1,4 +1,5 @@
 import json
+import os
 import hashlib
 import sqlite3
 import time
@@ -612,3 +613,30 @@ def delete_persona(persona_id):
         cur = conn.execute("DELETE FROM webhook_personas WHERE id = ?", (persona_id,))
         conn.commit()
         return cur.rowcount > 0
+
+
+# ---------- Housekeeping ----------
+
+def cleanup():
+    """Remove rows that belong to messages that no longer exist. Returns how many rows were removed."""
+    removed = 0
+    with closing(connect()) as conn:
+        for table in ("versions", "schedules", "button_uses"):
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE message_id NOT IN (SELECT id FROM messages)"
+            )
+            removed += cur.rowcount
+        conn.commit()
+    return removed
+
+
+def stats():
+    with closing(connect()) as conn:
+        counts = {}
+        for table in ("messages", "versions", "schedules", "templates", "button_uses", "webhook_personas"):
+            counts[table] = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+    try:
+        size = os.path.getsize(DB_PATH)
+    except OSError:
+        size = 0
+    return {"size_bytes": size, "counts": counts}
