@@ -4,7 +4,10 @@ import time
 from typing import Annotated, Literal, Optional, Union
 
 import discord
+import csv
+import io
 from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -67,6 +70,12 @@ class ScheduleToggleIn(StrictModel):
 
 class WebhookCreateIn(StrictModel):
     name: str
+
+
+class ResponseDecideIn(StrictModel):
+    decision: Literal["accepted", "denied"]
+    role_id: str = ""
+    dm_text: str = Field(default="", max_length=1500)
 
 
 class UpdateIn(StrictModel):
@@ -223,6 +232,8 @@ class RuleMixin(StrictModel):
     allowed_roles: list[str] = Field(default_factory=list, max_length=10)
     cooldown: StrictInt = Field(default=0, ge=0, le=86400)
     once: StrictBool = False
+    max_uses: StrictInt = Field(default=0, ge=0, le=1000000)
+    expires_at: StrictInt = Field(default=0, ge=0)
 
     @field_validator("allowed_roles")
     @classmethod
@@ -239,6 +250,7 @@ class ButtonModel(RuleMixin):
     style: Literal["grey", "blue", "green", "red"] = "grey"
     emoji: Optional[EmojiModel] = None
     action: ActionModel
+    actions: list[ActionModel] = Field(default_factory=list, max_length=5)
 
     @model_validator(mode="before")
     @classmethod
@@ -261,6 +273,7 @@ class DropdownOptionModel(RuleMixin):
     description: str = Field(default="", max_length=100)
     emoji: Optional[EmojiModel] = None
     action: OptionActionModel
+    actions: list[OptionActionModel] = Field(default_factory=list, max_length=5)
 
     @field_validator("id")
     @classmethod
@@ -347,6 +360,8 @@ class DropdownBlock(StrictModel):
     id: str
     type: Literal["dropdown"]
     placeholder: str = Field(default="", max_length=150)
+    min_values: StrictInt = Field(default=1, ge=1, le=25)
+    max_values: StrictInt = Field(default=1, ge=1, le=25)
     options: list[DropdownOptionModel] = Field(default_factory=list, max_length=25)
 
     @field_validator("id")
@@ -449,6 +464,8 @@ class FormFieldModel(StrictModel):
     style: Literal["short", "paragraph"] = "short"
     placeholder: str = Field(default="", max_length=100)
     required: StrictBool = True
+    min_length: StrictInt = Field(default=0, ge=0, le=4000)
+    max_length: StrictInt = Field(default=600, ge=1, le=4000)
 
     @field_validator("id")
     @classmethod
@@ -462,6 +479,9 @@ class FormModel(StrictModel):
     title: str = Field(default="", max_length=45)
     channel_id: str = ""
     thanks: str = Field(default="", max_length=1900)
+    accept_role_id: str = ""
+    accept_dm: str = Field(default="", max_length=1500)
+    deny_dm: str = Field(default="", max_length=1500)
     fields: list[FormFieldModel] = Field(default_factory=list, max_length=5)
 
     @field_validator("id")
@@ -1525,5 +1545,81 @@ def make_router(require_user, get_client, owner_id):
         require_owner_user(authorization)
         db.delete_access_request(req_id)
         return {"ok": True}
+
+    # ----- Click stats & Form responses (Phase 6) -----
+
+    @router.get("/messages/{message_id}/stats")
+    async def message_stats(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        return {"clicks": db.list_click_counts(message_id)}
+
+    @router.get("/messages/{message_id}/responses")
+    async def message_responses(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        return db.list_form_responses(message_id)
+
+    @router.get("/messages/{message_id}/responses/csv")
+    async def message_responses_csv(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        rows = db.list_form_responses(message_id)
+
+        def safe_cell(val):
+            s = str(val or "")
+            if s.startswith(("=", "+", "-", "@", "\t", "\r")):
+                return "'" + s
+            return s
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["ID", "Form ID", "User ID", "Username", "Status", "Submitted At", "Answers"])
+        for r in rows:
+            ans_str = " | ".join(f"{a.get('label', '')}: {a.get('answer', '')}" for a in r.get("answers", []))
+            w.writerow([
+                r["id"],
+                safe_cell(r["form_id"]),
+                safe_cell(r["user_id"]),
+                safe_cell(r["username"]),
+                safe_cell(r["status"]),
+                r["created_at"],
+                safe_cell(ans_str),
+            ])
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="responses-{message_id}.csv"'},
+        )
+
+    @router.post("/responses/{resp_id}/decide")
+    async def decide_response(resp_id: int, body: ResponseDecideIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        resp = db.get_form_response(resp_id)
+        if not resp:
+            raise HTTPException(404, "Response not found")
+        guild = await user_guild(uid, resp["guild_id"])
+        updated = db.set_form_response_status(resp_id, body.decision)
+
+        if body.decision == "accepted" and body.role_id and body.role_id.isdigit():
+            role = guild.get_role(int(body.role_id))
+            if role and guild.me.guild_permissions.manage_roles and role < guild.me.top_role and not role.managed:
+                p = role.permissions
+                if not (p.administrator or p.manage_guild or p.manage_roles):
+                    try:
+                        member = guild.get_member(int(resp["user_id"])) or await guild.fetch_member(int(resp["user_id"]))
+                        await member.add_roles(role, reason="Form response accepted")
+                    except discord.HTTPException:
+                        pass
+
+        if body.dm_text.strip():
+            try:
+                user = await get_client().fetch_user(int(resp["user_id"]))
+                await user.send(body.dm_text.strip()[:1500], allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                pass
+
+        return updated
 
     return router

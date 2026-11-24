@@ -108,12 +108,14 @@ def build_select(block, ctx):
             )
         )
     placeholder = str(block.get("placeholder") or "Choose an option...")[:150]
+    min_v = max(1, min(int(block.get("min_values") or 1), len(items)))
+    max_v = max(min_v, min(int(block.get("max_values") or 1), len(items)))
     select = discord.ui.Select(
         placeholder=placeholder,
         options=items,
         custom_id=f"m:{ctx['message_id']}:{block['id']}",
-        min_values=1,
-        max_values=1,
+        min_values=min_v,
+        max_values=max_v,
     )
     return select
 

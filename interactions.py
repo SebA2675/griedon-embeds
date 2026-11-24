@@ -78,6 +78,12 @@ def rule_problem(interaction, message, key, item):
                 if role:
                     names.append(role.name)
             return "You need one of these roles to use this: " + (", ".join(names) or "(role removed)")
+    expires_at = int(item.get("expires_at") or 0)
+    if expires_at > 0 and time.time() > expires_at:
+        return "This button has expired."
+    max_uses = int(item.get("max_uses") or 0)
+    if max_uses > 0 and db.get_click_count(message["id"], key) >= max_uses:
+        return "This button has reached its maximum number of uses."
     cooldown = int(item.get("cooldown") or 0)
     once = bool(item.get("once"))
     if cooldown > 0 or once:
@@ -139,7 +145,7 @@ async def run_action(interaction, message, action, on_done=None):
         if not form:
             await say(interaction, "This form was removed from the message.")
             return
-        await interaction.response.send_modal(forms.FormModal(form, on_done))
+        await interaction.response.send_modal(forms.FormModal(form, on_done, message_id=message["id"]))
     elif kind == "page":
         pages = message["layout"].get("pages") or []
         total = 1 + len(pages)
@@ -182,9 +188,20 @@ async def use_item(interaction, message, key, item):
             done = lambda: db.record_use(message["id"], key, user_id)
         await run_action(interaction, message, action, done)
         return
+    db.increment_click(message["id"], key)
     if counted:
         db.record_use(message["id"], key, interaction.user.id)
-    await run_action(interaction, message, action)
+    actions = item.get("actions")
+    if isinstance(actions, list) and actions:
+        for act in actions:
+            if not interaction.response.is_done():
+                await run_action(interaction, message, act)
+            elif act.get("type") == "reply":
+                resolved = variables.resolve_layout(message["layout"], guild=interaction.guild, channel=interaction.channel, user=interaction.user)
+                view = builder.build_reply_view(resolved, message["id"], act.get("reply_id"))
+                await interaction.followup.send(view=view, ephemeral=True)
+    else:
+        await run_action(interaction, message, action)
 
 
 async def handle(interaction):
@@ -206,11 +223,14 @@ async def handle(interaction):
         layout = message["layout"]
         if data.get("component_type") == 3:
             values = data.get("values") or []
-            option = find_option(layout, parts[2], values[0]) if values else None
-            if not option:
-                await say(interaction, "This option was removed from the message.")
+            if not values:
                 return
-            await use_item(interaction, message, parts[2] + "." + str(option.get("id")), option)
+            for val in values:
+                option = find_option(layout, parts[2], val)
+                if option and not interaction.response.is_done():
+                    await use_item(interaction, message, parts[2] + "." + str(option.get("id")), option)
+                elif option and (option.get("action") or {}).get("type") == "role":
+                    await handle_role(interaction, option.get("action"))
         else:
             button = find_button(layout, parts[2])
             if not button:

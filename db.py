@@ -154,7 +154,33 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS click_counts (
+                message_id INTEGER NOT NULL,
+                component_id TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (message_id, component_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS form_responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                guild_id TEXT NOT NULL,
+                form_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                answers_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sequences_guild ON sequences(guild_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_form_resp_msg ON form_responses(message_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_message ON schedules(message_id)")
@@ -821,3 +847,91 @@ def set_schedule_active(schedule_id, active):
         conn.execute("UPDATE schedules SET active = ? WHERE id = ?", (1 if active else 0, schedule_id))
         conn.commit()
     return get_schedule(schedule_id)
+def increment_click(message_id, component_id):
+    with closing(connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO click_counts (message_id, component_id, count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(message_id, component_id) DO UPDATE SET count = count + 1
+            """,
+            (message_id, str(component_id)),
+        )
+        conn.commit()
+
+
+def get_click_count(message_id, component_id):
+    with closing(connect()) as conn:
+        row = conn.execute(
+            "SELECT count FROM click_counts WHERE message_id = ? AND component_id = ?",
+            (message_id, str(component_id)),
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def list_click_counts(message_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT component_id, count FROM click_counts WHERE message_id = ?",
+            (message_id,),
+        ).fetchall()
+    return {r["component_id"]: int(r["count"]) for r in rows}
+
+
+def add_form_response(message_id, guild_id, form_id, user_id, username, answers):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        cnt = conn.execute(
+            "SELECT COUNT(*) AS n FROM form_responses WHERE message_id = ? AND form_id = ?",
+            (message_id, str(form_id)),
+        ).fetchone()["n"]
+        if cnt >= 5000:
+            conn.execute(
+                """
+                DELETE FROM form_responses WHERE id IN (
+                    SELECT id FROM form_responses WHERE message_id = ? AND form_id = ?
+                    ORDER BY created_at ASC LIMIT 1
+                )
+                """,
+                (message_id, str(form_id)),
+            )
+        cur = conn.execute(
+            """
+            INSERT INTO form_responses (message_id, guild_id, form_id, user_id, username, answers_json, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (message_id, str(guild_id), str(form_id), str(user_id), str(username)[:100], json.dumps(answers), now),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_form_responses(message_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM form_responses WHERE message_id = ? ORDER BY created_at DESC LIMIT 500",
+            (message_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["answers"] = json.loads(d.pop("answers_json", "[]"))
+        out.append(d)
+    return out
+
+
+def get_form_response(resp_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM form_responses WHERE id = ?", (resp_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["answers"] = json.loads(d.pop("answers_json", "[]"))
+    return d
+
+
+def set_form_response_status(resp_id, status):
+    with closing(connect()) as conn:
+        conn.execute("UPDATE form_responses SET status = ? WHERE id = ?", (status, resp_id))
+        conn.commit()
+    return get_form_response(resp_id)
