@@ -208,7 +208,15 @@ async def me(authorization: str = Header(default=None)):
         mine = await access.accessible_guilds(client, uid, OWNER_ID)
         if not mine:
             raise HTTPException(403, "You need to be an Administrator of a server where this bot is installed.")
-    return {"user_id": uid, "is_owner": uid == OWNER_ID}
+    u = client.get_user(int(uid))
+    if not u:
+        try:
+            u = await client.fetch_user(int(uid))
+        except Exception:
+            u = None
+    uname = (getattr(u, "global_name", None) or getattr(u, "display_name", None) or getattr(u, "name", None) or "") if u else ""
+    av = str(u.display_avatar.url) if u and getattr(u, "display_avatar", None) else ""
+    return {"user_id": uid, "is_owner": uid == OWNER_ID, "username": uname, "avatar_url": av}
 
 
 @app.post("/logout")
