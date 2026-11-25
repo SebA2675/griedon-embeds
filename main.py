@@ -167,6 +167,16 @@ async def login(n: str = ""):
     return RedirectResponse("https://discord.com/oauth2/authorize?" + urlencode(params))
 
 
+@app.get("/invite")
+async def invite_bot():
+    params = {
+        "client_id": CLIENT_ID,
+        "permissions": "275415022656",
+        "scope": "bot applications.commands",
+    }
+    return RedirectResponse("https://discord.com/oauth2/authorize?" + urlencode(params))
+
+
 @app.get("/auth/callback")
 async def callback(code: str = "", state: str = ""):
     data = read_token(state)
