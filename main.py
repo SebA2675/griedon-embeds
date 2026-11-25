@@ -255,6 +255,13 @@ class EmbedBot(discord.Client):
             db.set_posted(m["id"], str(inter.guild.id), str(inter.channel.id), str(sent.id))
             await inter.response.send_message(f"Posted **{m['name']}**!", ephemeral=True)
 
+        @self.tree.context_menu(name="Edit in dashboard")
+        async def ctx_edit_dashboard(inter: discord.Interaction, message: discord.Message):
+            if not inter.guild or not (inter.user.guild_permissions.administrator or db.is_editor(inter.guild.id, inter.user.id)):
+                await inter.response.send_message("Only Admins/Editors can use this.", ephemeral=True)
+                return
+            await inter.response.send_message(f"Open the dashboard to edit: {DASHBOARD_ORIGIN}/dashboard/", ephemeral=True)
+
         await self.tree.sync()
         port = int(get_setting("SERVER_PORT") or get_setting("PORT") or 8080)
         config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")

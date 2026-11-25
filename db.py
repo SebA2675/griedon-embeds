@@ -274,6 +274,41 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_feeds_guild ON feeds(guild_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS share_links (
+                token TEXT PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_by TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trigger_urls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS custom_commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(guild_id, name)
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_guild ON audit_log(guild_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_message ON versions(message_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(active, next_run)")
@@ -1320,4 +1355,89 @@ def delete_guild_data(guild_id):
             "stickies", "audit_log", "server_settings", "guild_editors",
         ):
             conn.execute(f"DELETE FROM {tbl} WHERE guild_id = ?", (gid,))
+        conn.commit()
+def create_share_link(token, message_id, expires_at, created_by):
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT INTO share_links (token, message_id, expires_at, created_by) VALUES (?, ?, ?, ?)",
+            (token, message_id, int(expires_at), str(created_by)),
+        )
+        conn.commit()
+
+
+def get_share_link(token):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM share_links WHERE token = ?", (token,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_triggers(message_id):
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT id, message_id, guild_id, channel_id, created_at FROM trigger_urls WHERE message_id = ? ORDER BY id DESC",
+            (message_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_trigger(message_id, guild_id, channel_id, token_hash):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO trigger_urls (message_id, guild_id, channel_id, token_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+            (message_id, str(guild_id), str(channel_id), token_hash, now),
+        )
+        conn.commit()
+        tid = cur.lastrowid
+    return {"id": tid, "message_id": message_id, "guild_id": str(guild_id), "channel_id": str(channel_id), "created_at": now}
+
+
+def get_trigger(trigger_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM trigger_urls WHERE id = ?", (trigger_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_trigger(trigger_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM trigger_urls WHERE id = ?", (trigger_id,))
+        conn.commit()
+
+
+def list_custom_commands(guild_id=None):
+    with closing(connect()) as conn:
+        if guild_id is None:
+            rows = conn.execute("SELECT * FROM custom_commands").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM custom_commands WHERE guild_id = ? ORDER BY name", (str(guild_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_custom_command(guild_id, name, description, message_id):
+    now = int(time.time())
+    with closing(connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO custom_commands (guild_id, name, description, message_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, name) DO UPDATE SET
+                description = excluded.description,
+                message_id = excluded.message_id
+            """,
+            (str(guild_id), name[:32].lower(), description[:100], int(message_id), now),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM custom_commands WHERE guild_id = ? AND name = ?", (str(guild_id), name[:32].lower())).fetchone()
+    return dict(row)
+
+
+def get_custom_command(cmd_id):
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM custom_commands WHERE id = ?", (cmd_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_custom_command(cmd_id):
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM custom_commands WHERE id = ?", (cmd_id,))
         conn.commit()

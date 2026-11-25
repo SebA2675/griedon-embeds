@@ -5,6 +5,9 @@ from typing import Annotated, Literal, Optional, Union
 
 import discord
 import csv
+import hashlib
+import secrets
+import aiohttp
 import io
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -107,6 +110,19 @@ class ServerSettingsIn(StrictModel):
 class EditorIn(StrictModel):
     user_id: str
 
+
+class ImportLinkIn(StrictModel):
+    url: str
+
+
+class TriggerCreateIn(StrictModel):
+    channel_id: str
+
+
+class CustomCmdIn(StrictModel):
+    name: str
+    description: str = "Reply with a saved message"
+    message_id: StrictInt
 
 class BulkReplaceIn(StrictModel):
     find: str
@@ -1870,6 +1886,196 @@ def make_router(require_user, get_client, owner_id):
         uid = require_user(authorization)
         await user_guild(uid, guild_id)
         db.delete_guild_data(guild_id)
+        return {"deleted": True}
+
+    # ----- Remaining PDF features: Import Link, Share Draft, Link Checker, Triggers, Custom Cmds -----
+
+    @router.post("/guilds/{guild_id}/import-link")
+    async def import_message_link(guild_id: str, body: ImportLinkIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        guild = await user_guild(uid, guild_id)
+        m = re.search(r"discord\.com/channels/(\d+)/(\d+)/(\d+)", body.url.strip())
+        if not m or m.group(1) != str(guild.id):
+            bad("Paste a Discord message link from this server")
+        ch = guild.get_channel_or_thread(int(m.group(2)))
+        if ch is None:
+            raise HTTPException(404, "Channel not found")
+        try:
+            msg = await ch.fetch_message(int(m.group(3)))
+        except discord.HTTPException as err:
+            raise discord_error(err)
+
+        embeds = []
+        for idx, em in enumerate(msg.embeds[:10]):
+            embeds.append({
+                "id": f"e{idx}",
+                "title": (em.title or "")[:256],
+                "description": (em.description or "")[:4096],
+                "color": f"#{em.colour.value:06x}" if em.colour else "#5865F2",
+                "url": em.url or "",
+                "author_name": (em.author.name if em.author else "") or "",
+                "author_url": (em.author.url if em.author else "") or "",
+                "author_icon": (em.author.icon_url if em.author else "") or "",
+                "image": (em.image.url if em.image else "") or "",
+                "thumbnail": (em.thumbnail.url if em.thumbnail else "") or "",
+                "footer_text": (em.footer.text if em.footer else "") or "",
+                "footer_icon": (em.footer.icon_url if em.footer else "") or "",
+                "timestamp": bool(em.timestamp),
+                "fields": [
+                    {"id": f"f{idx}_{fi}", "name": fl.name[:256], "value": fl.value[:1024], "inline": bool(fl.inline)}
+                    for fi, fl in enumerate(em.fields[:25])
+                ],
+            })
+        layout = {
+            "kind": "classic",
+            "guild_id": str(guild.id),
+            "content": (msg.content or "")[:2000],
+            "embeds": embeds,
+            "blocks": [],
+            "replies": [],
+            "forms": [],
+        }
+        check_layout(layout)
+        name = clean_name((embeds[0]["title"] if embeds else msg.content) or "Imported message")
+        return db.create_message(name, layout, str(guild.id))
+
+    @router.post("/messages/{message_id}/share")
+    async def create_share(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        tok = secrets.token_urlsafe(24)
+        exp = int(time.time()) + 7 * 86400
+        db.create_share_link(tok, message_id, exp, uid)
+        return {"token": tok, "expires_at": exp}
+
+    @router.get("/share/{token}")
+    async def read_share(token: str):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token):
+            raise HTTPException(404, "Share link not found")
+        link = db.get_share_link(token)
+        if not link or int(link["expires_at"]) < int(time.time()):
+            raise HTTPException(404, "Share link expired or not found")
+        msg = db.get_message(link["message_id"])
+        if not msg:
+            raise HTTPException(404, "Message not found")
+        layout = json.loads(json.dumps(msg["layout"]))
+        layout["guild_id"] = ""
+        strip_guild_refs(layout)
+        return {"name": msg["name"], "layout": layout, "expires_at": link["expires_at"]}
+
+    @router.post("/messages/{message_id}/check-links")
+    async def check_message_links(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        urls = set()
+
+        def _collect(obj):
+            if isinstance(obj, list):
+                for x in obj:
+                    _collect(x)
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in ("url", "author_url", "author_icon", "image", "thumbnail", "footer_icon") and isinstance(v, str) and v.strip():
+                        urls.add(v.strip())
+                    elif k == "urls" and isinstance(v, list):
+                        for u in v:
+                            if isinstance(u, str) and u.strip():
+                                urls.add(u.strip())
+                    else:
+                        _collect(v)
+
+        _collect(found["layout"])
+        broken = []
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
+            for u in list(urls)[:25]:
+                if not u.startswith("https://") or not automation.is_safe_public_url(u):
+                    broken.append({"url": u, "reason": "Unsafe or non-https URL"})
+                    continue
+                try:
+                    async with sess.head(u, allow_redirects=True) as resp:
+                        if resp.status >= 400:
+                            broken.append({"url": u, "reason": f"HTTP {resp.status}"})
+                except Exception:
+                    broken.append({"url": u, "reason": "Unreachable"})
+        return {"checked": len(urls), "broken": broken}
+
+    @router.get("/messages/{message_id}/triggers")
+    async def get_message_triggers(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await load_message(message_id, uid)
+        return db.list_triggers(message_id)
+
+    @router.post("/messages/{message_id}/triggers")
+    async def add_message_trigger(message_id: int, body: TriggerCreateIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        gid = found["guild_id"]
+        if not gid:
+            bad("Choose a server for this message first")
+        find_channel(get_client(), gid, body.channel_id)
+        secret = secrets.token_urlsafe(24)
+        thash = hashlib.sha256(secret.encode()).hexdigest()
+        row = db.create_trigger(message_id, gid, body.channel_id, thash)
+        row["secret"] = secret
+        return row
+
+    @router.delete("/triggers/{trigger_id}")
+    async def remove_trigger(trigger_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        t = db.get_trigger(trigger_id)
+        if not t:
+            raise HTTPException(404, "Trigger not found")
+        await user_guild(uid, t["guild_id"])
+        db.delete_trigger(trigger_id)
+        return {"deleted": True}
+
+    @router.post("/trigger/{trigger_id}")
+    async def fire_trigger(trigger_id: int, body: dict, authorization: str = Header(default=None)):
+        t = db.get_trigger(trigger_id)
+        if not t:
+            raise HTTPException(404, "Trigger not found")
+        secret = (authorization[7:] if authorization and authorization.startswith("Bearer ") else "") or str(body.get("secret") or "")
+        if not secret or hashlib.sha256(secret.encode()).hexdigest() != t["token_hash"]:
+            raise HTTPException(401, "Invalid trigger secret")
+        msg = db.get_message(t["message_id"])
+        if not msg:
+            raise HTTPException(404, "Message deleted")
+        guild = get_client().get_guild(int(t["guild_id"]))
+        ch = find_channel(get_client(), t["guild_id"], t["channel_id"])
+        raw_vars = body.get("variables") if isinstance(body.get("variables"), dict) else {}
+        clean = {str(k): str(v)[:2000] for k, v in raw_vars.items()}
+        resolved = variables.resolve_layout(msg["layout"], guild=guild, channel=ch, overrides=clean)
+        view = make_view(resolved, msg["id"])
+        sent = await ch.send(**view, allowed_mentions=SAFE_MENTIONS)
+        db.log_audit(t["guild_id"], "trigger", "trigger_post", f"Triggered '{msg['name']}' in #{ch.name}")
+        return {"ok": True, "posted_id": str(sent.id)}
+
+    @router.get("/guilds/{guild_id}/commands")
+    async def get_guild_commands(guild_id: str, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        return db.list_custom_commands(guild_id)
+
+    @router.post("/guilds/{guild_id}/commands")
+    async def add_guild_command(guild_id: str, body: CustomCmdIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        await user_guild(uid, guild_id)
+        name = re.sub(r"[^a-z0-9_-]", "", body.name.strip().lower())[:32]
+        if not name:
+            bad("Command name must use lowercase letters, numbers, - or _")
+        if len(db.list_custom_commands(guild_id)) >= 15:
+            bad("Max 15 custom commands per server")
+        row = db.create_custom_command(guild_id, name, body.description.strip() or "Reply", body.message_id)
+        return row
+
+    @router.delete("/commands/{cmd_id}")
+    async def remove_guild_command(cmd_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        c = db.get_custom_command(cmd_id)
+        if not c:
+            raise HTTPException(404, "Command not found")
+        await user_guild(uid, c["guild_id"])
+        db.delete_custom_command(cmd_id)
         return {"deleted": True}
 
     return router
