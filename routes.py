@@ -119,6 +119,10 @@ class TriggerCreateIn(StrictModel):
     channel_id: str
 
 
+class CopyToIn(StrictModel):
+    target_guild_id: str
+
+
 class CustomCmdIn(StrictModel):
     name: str
     description: str = "Reply with a saved message"
@@ -2077,5 +2081,40 @@ def make_router(require_user, get_client, owner_id):
         await user_guild(uid, c["guild_id"])
         db.delete_custom_command(cmd_id)
         return {"deleted": True}
+
+    @router.post("/messages/{message_id}/copy-to")
+    async def copy_message_to_guild(message_id: int, body: CopyToIn, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        target_gid = body.target_guild_id.strip()
+        await user_guild(uid, target_gid)
+        if db.count_messages(target_gid) >= MAX_PER_GUILD:
+            raise HTTPException(400, "Target server has reached the saved-message limit")
+        layout = json.loads(json.dumps(found["layout"]))
+        if str(found.get("guild_id") or "") != target_gid:
+            strip_guild_refs(layout)
+        layout["guild_id"] = target_gid
+        created = db.create_message(found["name"], layout, target_gid)
+        db.log_audit(target_gid, uid, "copy_in", f"Copied '{found['name']}' into this server")
+        return created
+
+    @router.post("/messages/{message_id}/verify-posted")
+    async def verify_posted_message(message_id: int, authorization: str = Header(default=None)):
+        uid = require_user(authorization)
+        found = await load_message(message_id, uid)
+        if not found["posted_message_id"]:
+            return {"exists": False, "message": found}
+        ch = get_client().get_channel(int(found["channel_id"])) if str(found.get("channel_id") or "").isdigit() else None
+        if ch is None:
+            db.clear_posted(message_id)
+            return {"exists": False, "message": db.get_message(message_id)}
+        try:
+            await ch.fetch_message(int(found["posted_message_id"]))
+            return {"exists": True, "message": found}
+        except discord.NotFound:
+            db.clear_posted(message_id)
+            return {"exists": False, "message": db.get_message(message_id)}
+        except discord.HTTPException:
+            return {"exists": True, "message": found}
 
     return router

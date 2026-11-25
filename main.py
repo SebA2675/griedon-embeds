@@ -255,6 +255,36 @@ class EmbedBot(discord.Client):
             db.set_posted(m["id"], str(inter.guild.id), str(inter.channel.id), str(sent.id))
             await inter.response.send_message(f"Posted **{m['name']}**!", ephemeral=True)
 
+        @self.tree.command(name="faq", description="Send a server custom command message")
+        @discord.app_commands.describe(command="Name of the custom command")
+        async def cmd_faq(inter: discord.Interaction, command: str):
+            if not inter.guild:
+                await inter.response.send_message("Use this inside a server.", ephemeral=True)
+                return
+            cmds = db.list_custom_commands(str(inter.guild.id))
+            hit = next((c for c in cmds if c["name"] == command.strip().lower()), None)
+            if not hit:
+                await inter.response.send_message("Custom command not found.", ephemeral=True)
+                return
+            m = db.get_message_cached(int(hit["message_id"]))
+            if not m or str(m.get("guild_id")) != str(inter.guild.id):
+                await inter.response.send_message("Saved message no longer exists.", ephemeral=True)
+                return
+            resolved = variables.resolve_layout(m["layout"], guild=inter.guild, channel=inter.channel, user=inter.user)
+            payload = builder.build_payload(resolved, m["id"])
+            await inter.response.send_message(**payload, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False))
+
+        @cmd_faq.autocomplete("command")
+        async def cmd_faq_ac(inter: discord.Interaction, current: str):
+            if not inter.guild:
+                return []
+            q = current.strip().lower()
+            cmds = db.list_custom_commands(str(inter.guild.id))
+            return [
+                discord.app_commands.Choice(name=f"{c['name']} — {c['description'][:40]}", value=c["name"])
+                for c in cmds if not q or q in c["name"]
+            ][:25]
+
         @self.tree.context_menu(name="Edit in dashboard")
         async def ctx_edit_dashboard(inter: discord.Interaction, message: discord.Message):
             if not inter.guild or not (inter.user.guild_permissions.administrator or db.is_editor(inter.guild.id, inter.user.id)):
